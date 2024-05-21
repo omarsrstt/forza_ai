@@ -1,3 +1,6 @@
+# Ignore deprecated code files and assets
+deprecated
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
