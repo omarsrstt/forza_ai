@@ -1,6 +1,6 @@
 import pygame
 import logging
-import keyboard
+import vgamepad as vg
 import numpy as np
 
 ### For joystick, we are interested in the following buttons ###
@@ -88,6 +88,59 @@ class GamepadListener():
         self.events[4] = self.previous_triggers[0]
         self.events[5] = self.previous_triggers[1]
         self.events[6] = self.previous_triggers[2]
+
+
+class GamepadWriter():
+    def __init__(self) -> None:
+        # Create Xbox 360 gamepad
+        self.gamepad = vg.VX360Gamepad()
+        self.gamepad.reset()
+
+        # Create dict to store controller commands info
+        # [L1, R1, Square, Circle, LR, R2, L2]
+        self.events = np.zeros(7)
+
+    def update(self, events):
+        self.events = events
+        
+        ### Button states
+        # L1/LB control
+        if self.events[0] == 1:
+            self.gamepad.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER)
+        else:
+            self.gamepad.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER)
+        
+        # R1/RB control
+        if self.events[1] == 1:
+            self.gamepad.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER)
+        else:
+            self.gamepad.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER)
+
+        # Square/X control
+        if self.events[2] == 1: 
+            self.gamepad.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_X)
+        else: 
+            self.gamepad.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_X)
+
+        # Circle/B control
+        if self.events[3] == 1:
+            self.gamepad.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
+        else:
+            self.gamepad.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
+
+
+        # Update LR state
+        self.gamepad.left_joystick_float(x_value_float=self.events[4], y_value_float=0.0)
+
+        # Update trigger states
+        self.gamepad.left_trigger_float(value_float=self.events[5])
+        self.gamepad.right_trigger_float(value_float=self.events[6])
+
+        # Update and send commands
+        self.gamepad.update()
+
+    def reset_controller_state(self):
+        self.gamepad.reset()
 
 
 if __name__ == "__main__":
