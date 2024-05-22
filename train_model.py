@@ -54,6 +54,34 @@ class ConvNeXtTinyRegression(nn.Module):
         return self.model(x)
 
 
+class ConvNextTinyLSTMRegression(nn.Module):
+    def __init__(self, num_outputs=7):
+        super(ConvNextTinyLSTMRegression, self).__init__()
+        # Load the pre-trained ConvNeXt Tiny model
+        self.convnext = models.convnext_tiny(pretrained=True)
+        # Remove the final classification layer
+        self.convnext.classifier = nn.Sequential(*list(self.convnext.classifier.children())[:-1])
+        self.lstm = nn.LSTM(input_size=768, hidden_size=512, num_layers=1, batch_first=True)
+        self.fc = nn.Linear(512, num_outputs)
+    
+    def forward(self, x):
+        # Apply CNN
+        batch_size, seq_len, C, H, W = x.shape
+        convnext_out = []
+        for t in range(seq_len):
+            out = self.convnext(x[:, t, :, :, :])
+            out = out.view(batch_size, -1)
+            convnext_out.append(out)
+        convnext_out = torch.stack(convnext_out, dim=1)
+        
+        # Apply LSTM
+        lstm_out, _ = self.lstm(convnext_out)
+        
+        # Apply final fully connected layer
+        out = self.fc(lstm_out[:, -1, :])
+        return out
+
+
 def main():
     # # Define transformations for the images
     # transform = transforms.Compose([
