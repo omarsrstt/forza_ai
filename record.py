@@ -39,11 +39,14 @@ def main():
     # Get sequence prefix for storing the data
     existing_files = os.listdir(output_dir)
     sequence_numbers = [int(file_name.split('_')[1]) for file_name in existing_files if file_name.startswith('seq') and file_name.split('_')[1].isdigit()]
-    sequence_number = max(sequence_numbers, 0) + 1
+    max_seq_num = 0 if not sequence_numbers else max(sequence_numbers)
+    sequence_number = max(max_seq_num, 0) + 1
     prefix = "seq_" + str(sequence_number)
 
     # File index for saves
     index = 1
+
+    start_buffer()
 
     with mss() as sct:
         while True:
