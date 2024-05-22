@@ -3,6 +3,7 @@ import cv2
 import time
 import json
 import pygame
+import keyboard
 import numpy as np
 from mss import mss
 from gamepad import GamepadListener, GamepadWriter
@@ -17,7 +18,7 @@ def start_buffer():
 # monitor_region = {"top": 40, "left": -1920, "width": 1730, "height": 960}
 # monitor_region = {"top": 40, "left": -1920, "width": 970, "height": 550}
 # monitor_region = {"top": 0, "left": -1920, "width": 1920, "height": 1080}
-monitor_region = {"top": 0, "left": 1920, "width": 1920, "height": 1080}
+monitor_region = {"top": 0, "left": -1920, "width": 1920, "height": 1080}
 
 
 def main():
@@ -58,7 +59,7 @@ def main():
             events = gamepadlistener.get_joystick_events()
 
             # Save images
-            image_path = os.path.join(output_dir, f"{prefix}_image_{sequence_number}_{index}.png")
+            image_path = os.path.join(output_dir, f"{prefix}_image_{sequence_number}_{index}.jpg")
             cv2.imwrite(image_path, resized_image)
             
             # Save events
@@ -75,8 +76,11 @@ def main():
             # Limit recording to 30 FPS
             clock.tick(30)
 
+            # Increment index
+            index += 1
+
             # Exit loop if 'q' is pressed
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            if keyboard.is_pressed('q'):
                 break
     
     # Close OpenCV windows
