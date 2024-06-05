@@ -1,5 +1,6 @@
 import pygame
 import logging
+import keyboard
 import vgamepad as vg
 import numpy as np
 
@@ -10,15 +11,15 @@ import numpy as np
 # 1536 -> controller axes
 
 # Buttons
-# 'button': 4 -> L1
-# 'button': 5 -> R1
-# 'button': 2 -> Square
-# 'button': 1 -> Circle
+# 'button': 4 -> L1/LB
+# 'button': 5 -> R1/RB
+# 'button': 2 -> Square/X
+# 'button': 1 -> Circle/B
 
 # Triggers
 # 'axis': 0, 'value': value in range [-1,1] -> L-R
-# 'axis': 5, 'value': value in range [-1,1] -> R2
-# 'axis': 4, 'value': value in range [-1,1] -> L2
+# 'axis': 5, 'value': value in range [-1,1] -> R2/RT
+# 'axis': 4, 'value': value in range [-1,1] -> L2/LT
 
 class GamepadListener():
     def __init__(self, logging_level = logging.INFO):
@@ -147,3 +148,5 @@ if __name__ == "__main__":
     gamepad_listener = GamepadListener(logging_level=logging.DEBUG)
     while True:
         gamepad_listener.get_joystick_events()
+        if keyboard.is_pressed('q'):
+                break
