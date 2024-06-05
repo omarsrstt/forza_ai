@@ -7,6 +7,7 @@ dataset
 # Ignore logs folder
 wandb
 lightning_logs
+forza-convnext-lstm
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
