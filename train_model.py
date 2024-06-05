@@ -99,7 +99,7 @@ class ForzaLSTMDataset(Dataset):
                 event_data = json.load(f)
             events.append(event_data)
         
-        return torch.stack(image), torch.tensor(events, dtype=torch.float32)
+        return images, torch.tensor(events, dtype=torch.float32)
 
 
 # Define the ConvNeXt Tiny model for regression
@@ -130,7 +130,7 @@ class ConvNextTinyLSTMRegression(nn.Module):
         # batch_size, C, H, W = x.shape
 
         convnext_out = []
-        for t in range(seq_len):
+        for t in range(seq_len): # each output of the series is appended
             out = self.convnext(x[:, t, :, :, :])
             out = out.view(batch_size, -1)
             convnext_out.append(out)
@@ -190,6 +190,7 @@ def main():
     # Create dataset and dataloader
     data_dir = 'dataset'
     dataset = ForzaDataset(data_dir, transform=transform)
+    # dataset = ForzaLSTMDataset(data_dir, transform=transform)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=4)
 
 
