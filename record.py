@@ -32,6 +32,9 @@ def main():
     # Resize input image
     RESIZE_DIMS = (224, 224)
 
+    # Specify record FPS
+    RECORD_FPS_CAP = 30
+
     # Create folder to store recorded data
     OUTPUT_DIR = "dataset"
     if not os.path.exists(OUTPUT_DIR):
@@ -75,7 +78,7 @@ def main():
             last_time = current_time
 
             # Limit recording to 30 FPS
-            clock.tick(30)
+            clock.tick(RECORD_FPS_CAP)
 
             # Increment index
             index += 1
