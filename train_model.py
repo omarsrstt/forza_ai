@@ -1,11 +1,18 @@
 import os
 import json
-import torch
+import wandb
 from PIL import Image
-import torch.nn as nn
 from natsort import natsorted
+
+import torch
+import torch.nn as nn
+import torch.nn as nn
+from torchmetrics import Accuracy, MeanAbsoluteError
 from torchvision import transforms, models
 from torch.utils.data import Dataset, DataLoader
+
+import lightning as L
+from lightning.pytorch.loggers import WandbLogger
 
 class ForzaDataset(Dataset):
     def __init__(self, 
@@ -81,6 +88,38 @@ class ConvNextTinyLSTMRegression(nn.Module):
         out = self.fc(lstm_out[:, -1, :])
         return out
 
+class ForzaLightning(L.LightningModule):
+    def __init__(self, 
+                 model):
+        super().__init__()
+        self.model = model
+        self.criterion = torch.nn.MSELoss()
+        self.mae = MeanAbsoluteError()
+
+    def training_step(self, batch, batch_idx):
+        images, controls = batch
+        
+        # Forward pass
+        output_controls = self(images)
+        
+        # Loss calculation
+        loss = self.criterion(output_controls, controls)
+        
+        # Calculate metric
+        mae = self.mae(output_controls, controls)
+
+        # Logging
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        return loss
+
+    def forward(self, x):
+        self.model(x)
+    
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer=optimizer, T_0=10)
+        return [optimizer], [scheduler]
+
 
 def main():
     # # Define transformations for the images
@@ -96,6 +135,7 @@ def main():
 
     # Load model for training
     model = ConvNeXtTinyRegression()
+    # model = ConvNextTinyLSTMRegression()
 
     # # Example of iterating through the dataloader
     # for images, events in dataloader:
