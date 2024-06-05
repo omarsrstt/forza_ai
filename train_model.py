@@ -91,7 +91,7 @@ class ConvNextTinyLSTMRegression(nn.Module):
 class ForzaLightning(L.LightningModule):
     def __init__(self, 
                  model):
-        super().__init__()
+        super(ForzaLightning, self).__init__()
         self.model = model
         self.criterion = torch.nn.MSELoss()
         self.mae = MeanAbsoluteError()
@@ -149,6 +149,7 @@ def main():
                         enable_checkpointing=True,
                         deterministic=True,
                         accelerator="cuda")
+    trainer.fit(model=model, train_dataloaders=dataloader)
 
 
 if __name__ == "__main__":
