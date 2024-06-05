@@ -4,6 +4,9 @@ deprecated
 # Ignore dataset folder
 dataset
 
+# Ignore logs folder
+wandb
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
