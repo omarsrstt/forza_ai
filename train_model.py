@@ -7,7 +7,7 @@ from natsort import natsorted
 import torch
 import torch.nn as nn
 import torch.nn as nn
-from torchmetrics import Accuracy, MeanAbsoluteError
+from torchmetrics.regression import MeanAbsoluteError
 from torchvision import transforms, models
 from torch.utils.data import Dataset, DataLoader
 
@@ -169,7 +169,7 @@ class ForzaLightning(L.LightningModule):
         return loss
 
     def forward(self, x):
-        self.model(x)
+        return self.model(x)
     
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3)
@@ -179,7 +179,8 @@ class ForzaLightning(L.LightningModule):
 
 def main():
     # Training consts
-    SUPRESS_LOGS = True
+    SUPRESS_LOGS = False
+    NUM_EPOCHS = 100
 
     # Define transformations for the images
     transform = transforms.Compose([
@@ -201,8 +202,8 @@ def main():
         wandb_logger = None
 
     # Load model for training
-    # model = ConvNeXtTinyRegression()
-    model = ConvNextTinyLSTMRegression()
+    model = ConvNeXtTinyRegression()
+    # model = ConvNextTinyLSTMRegression()
 
     # Use the forza lightning module
     forzalightning = ForzaLightning(model=model)
@@ -210,7 +211,7 @@ def main():
     # Use lightning trainer for training
     trainer = L.Trainer(precision='16-mixed',
                         logger=wandb_logger,
-                        max_epochs = 10,
+                        max_epochs = NUM_EPOCHS,
                         enable_checkpointing=True,
                         deterministic=True,
                         accelerator="cuda")
