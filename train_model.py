@@ -49,6 +49,59 @@ class ForzaDataset(Dataset):
         return image, events
     
 
+class ForzaLSTMDataset(Dataset):
+    def __init__(self, 
+                 data_dir = "./dataset", 
+                 transform=None):
+        self.data_dir = data_dir
+        self.transform = transform
+        self.sequences = self.group_sequences()
+
+    def group_sequences(self):
+        # Natsort will order the files in the correct manner such that each image file will correspond with its event file
+        image_files = natsorted([f for f in os.listdir(self.data_dir) if f.endswith('.jpg') or f.endswith('.png')])
+        event_files = natsorted([f for f in os.listdir(self.data_dir) if f.endswith('.json')])
+        assert len(image_files) == len(event_files), "Number of images and event files must be the same"
+
+        sequences = {}
+        for image_file, event_file in zip(image_files, event_files):
+            # get sequence number
+            seq_number = int(image_file.split("_")[1])
+            if seq_number not in sequences: # If sequence doesn't exist, create new
+                sequences[seq_number] = {"images": [],
+                                         "events": []}
+            sequences[seq_number]["images"].append(image_file)
+            sequences[seq_number]["events"].append(event_file)
+
+        return sequences    # return grouped sequences
+
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        seq_number = list(self.sequences.keys())[idx]
+        sequence_data = self.sequences[seq_number]
+
+        # Load all sequence images
+        images = []
+        for image_name in sequence_data["images"]:
+            image_path = os.path.join(self.data_dir, image_name)
+            # Load image
+            image = Image.open(image_path)
+            if self.transform:
+                image = self.transform(image)
+            images.append(image)
+
+        events = []
+        for event_name in sequence_data['events']:
+            event_path = os.path.join(self.data_dir, event_name)
+            with open(event_path, 'r') as f:
+                event_data = json.load(f)
+            events.append(event_data)
+        
+        return torch.stack(image), torch.tensor(events, dtype=torch.float32)
+
+
 # Define the ConvNeXt Tiny model for regression
 class ConvNeXtTinyRegression(nn.Module):
     def __init__(self, num_outputs=7):
@@ -74,6 +127,8 @@ class ConvNextTinyLSTMRegression(nn.Module):
     def forward(self, x):
         # Apply CNN
         batch_size, seq_len, C, H, W = x.shape
+        # batch_size, C, H, W = x.shape
+
         convnext_out = []
         for t in range(seq_len):
             out = self.convnext(x[:, t, :, :, :])
@@ -123,6 +178,9 @@ class ForzaLightning(L.LightningModule):
 
 
 def main():
+    # Training consts
+    SUPRESS_LOGS = True
+
     # Define transformations for the images
     transform = transforms.Compose([
         transforms.Resize((64, 64)),
@@ -136,11 +194,17 @@ def main():
 
 
     # Initialized WandB logger
-    wandb_logger = WandbLogger(project='forza-convnext-lstm')
+    if not SUPRESS_LOGS:
+        wandb_logger = WandbLogger(project='forza-convnext-lstm')
+    else:
+        wandb_logger = None
 
     # Load model for training
     # model = ConvNeXtTinyRegression()
     model = ConvNextTinyLSTMRegression()
+
+    # Use the forza lightning module
+    forzalightning = ForzaLightning(model=model)
 
     # Use lightning trainer for training
     trainer = L.Trainer(precision='16-mixed',
@@ -149,7 +213,8 @@ def main():
                         enable_checkpointing=True,
                         deterministic=True,
                         accelerator="cuda")
-    trainer.fit(model=model, train_dataloaders=dataloader)
+    
+    trainer.fit(model=forzalightning, train_dataloaders=dataloader)
 
 
 if __name__ == "__main__":
