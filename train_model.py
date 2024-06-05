@@ -126,12 +126,12 @@ class ConvNextTinyLSTMRegression(nn.Module):
     
     def forward(self, x):
         # Apply CNN
-        batch_size, seq_len, C, H, W = x.shape
+        seq_len, batch_size, C, H, W = x.shape
         # batch_size, C, H, W = x.shape
 
         convnext_out = []
-        for t in range(seq_len): # each output of the series is appended
-            out = self.convnext(x[:, t, :, :, :])
+        for t in range(seq_len): # compute for each time step
+            out = self.convnext(x[t, :, :, :, :])
             out = out.view(batch_size, -1)
             convnext_out.append(out)
         convnext_out = torch.stack(convnext_out, dim=1)
