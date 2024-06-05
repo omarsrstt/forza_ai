@@ -110,6 +110,7 @@ class ForzaLightning(L.LightningModule):
 
         # Logging
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('mae', mae, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     def forward(self, x):
@@ -122,26 +123,32 @@ class ForzaLightning(L.LightningModule):
 
 
 def main():
-    # # Define transformations for the images
-    # transform = transforms.Compose([
-    #     transforms.Resize((64, 64)),
-    #     transforms.ToTensor()
-    # ])
+    # Define transformations for the images
+    transform = transforms.Compose([
+        transforms.Resize((64, 64)),
+        transforms.ToTensor()
+    ])
 
-    # # Create dataset and dataloader
-    # data_dir = 'data'  # Replace with your data directory
-    # dataset = ForzaDataset(data_dir, transform=transform)
-    # dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=4)
+    # Create dataset and dataloader
+    data_dir = 'dataset'
+    dataset = ForzaDataset(data_dir, transform=transform)
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=4)
+
+
+    # Initialized WandB logger
+    wandb_logger = WandbLogger(project='forza-convnext-lstm')
 
     # Load model for training
-    model = ConvNeXtTinyRegression()
-    # model = ConvNextTinyLSTMRegression()
+    # model = ConvNeXtTinyRegression()
+    model = ConvNextTinyLSTMRegression()
 
-    # # Example of iterating through the dataloader
-    # for images, events in dataloader:
-    #     print(images.shape)  # (batch_size, 3, 64, 64)
-    #     print(events.shape)  # (batch_size, 7)
-    #     # Your training code here
+    # Use lightning trainer for training
+    trainer = L.Trainer(precision='16-mixed',
+                        logger=wandb_logger,
+                        max_epochs = 10,
+                        enable_checkpointing=True,
+                        deterministic=True,
+                        accelerator="cuda")
 
 
 if __name__ == "__main__":
