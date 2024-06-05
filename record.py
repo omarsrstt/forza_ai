@@ -18,7 +18,8 @@ def start_buffer():
 # MONITOR_REGION = {"top": 40, "left": -1920, "width": 1730, "height": 960}
 # MONITOR_REGION = {"top": 40, "left": -1920, "width": 970, "height": 550}
 # MONITOR_REGION = {"top": 0, "left": -1920, "width": 1920, "height": 1080}
-MONITOR_REGION = {"top": 0, "left": -1920, "width": 1920, "height": 1080}
+# MONITOR_REGION = {"top": 0, "left": -1920, "width": 1920, "height": 1080} # Left monitor
+MONITOR_REGION = {"top": 0, "left": 0, "width": 1920, "height": 1080} # Right monitor
 
 
 def main():
@@ -33,7 +34,7 @@ def main():
     RESIZE_DIMS = (224, 224)
 
     # Specify record FPS
-    RECORD_FPS_CAP = 30
+    RECORD_FPS_CAP = 15
 
     # Create folder to store recorded data
     OUTPUT_DIR = "dataset"
