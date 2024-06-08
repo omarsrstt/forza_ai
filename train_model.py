@@ -149,6 +149,11 @@ class ForzaLightning(L.LightningModule):
         super(ForzaLightning, self).__init__()
         self.model = model
         self.criterion = torch.nn.MSELoss()
+
+        # Save hyperparameters (if any)
+        self.save_hyperparameters()
+
+        # Initialize metrics
         self.mae = MeanAbsoluteError()
 
     def training_step(self, batch, batch_idx):
