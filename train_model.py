@@ -197,8 +197,7 @@ def main():
     data_dir = 'dataset'
     dataset = ForzaDataset(data_dir, transform=transform)
     # dataset = ForzaLSTMDataset(data_dir, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=4)
-
+    dataloader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=4)
 
     # Initialized WandB logger
     if not SUPRESS_LOGS:
