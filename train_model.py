@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import wandb
 from PIL import Image
@@ -51,56 +52,101 @@ class ForzaDataset(Dataset):
 
 class ForzaLSTMDataset(Dataset):
     def __init__(self, 
-                 data_dir = "./dataset", 
-                 transform=None):
+                 data_dir: str = "./dataset", 
+                 transform = None,
+                 sequence_length: int = 100):
         self.data_dir = data_dir
         self.transform = transform
-        self.sequences = self.group_sequences()
+        self.sequence_length = sequence_length
+        self.sequences = {}  # {sid: [(frame_id, img_filename, event_filename), ...]}
 
-    def group_sequences(self):
-        # Natsort will order the files in the correct manner such that each image file will correspond with its event file
+        # Regular expressions to extract sequence ID and frame ID
+        img_pattern = re.compile(r'seq_(\d+)_image_\d+_(\d+)\.(jpg|png)')
+        event_pattern = re.compile(r'seq_(\d+)_events_\d+_(\d+)\.json')
+
+        # Store file names
         image_files = natsorted([f for f in os.listdir(self.data_dir) if f.endswith('.jpg') or f.endswith('.png')])
         event_files = natsorted([f for f in os.listdir(self.data_dir) if f.endswith('.json')])
         assert len(image_files) == len(event_files), "Number of images and event files must be the same"
 
-        sequences = {}
-        for image_file, event_file in zip(image_files, event_files):
-            # get sequence number
-            seq_number = int(image_file.split("_")[1])
-            if seq_number not in sequences: # If sequence doesn't exist, create new
-                sequences[seq_number] = {"images": [],
-                                         "events": []}
-            sequences[seq_number]["images"].append(image_file)
-            sequences[seq_number]["events"].append(event_file)
+        # Organize files by sequence ID
+        img_files_by_sid = {} # {sid: [(frame_id, img_filename), ...]}
+        for img_file in image_files:
+            match = img_pattern.match(img_file)
+            if match:
+                sid, fid, _ = match.groups()
+                if sid not in img_files_by_sid:
+                    img_files_by_sid[sid] = []
+                img_files_by_sid[sid].append((int(fid), img_file))
 
-        return sequences    # return grouped sequences
+        event_files_by_sid = {} # {sid: [(frame_id, event_filename), ...]}
+        for event_file in event_files:
+            match = event_pattern.match(event_file)
+            if match:
+                sid, fid = match.groups()
+                if sid not in event_files_by_sid:
+                    event_files_by_sid[sid] = []
+                event_files_by_sid[sid].append((int(fid), event_file))
+
+        # Combine image and event files, ensuring matching frame IDs
+        for sid in img_files_by_sid:
+            if sid in event_files_by_sid:
+                img_frames = dict(img_files_by_sid[sid]) # {frame_id: img_filename}
+                event_frames = dict(event_files_by_sid[sid]) # {frame_id: event_filename}
+                common_fids = sorted(set(img_frames.keys()) & set(event_frames.keys()))
+                sequence = []
+                for fid in common_fids:
+                    img_filename = img_frames[fid]
+                    event_filename = event_frames[fid]
+                    sequence.append((fid, img_filename, event_filename))
+                self.sequences[sid] = natsorted(sequence)
+            else:
+                print(f"Warning: No event files for sequence {sid}")
+
+        # Generate samples with fixed sequence length
+        self.samples = []  # Each sample is a list of (img_path, event_path)
+        sequence_step_size = max(1, sequence_length//2)
+        for sid in self.sequences:
+            frames = self.sequences[sid]
+            num_frames = len(frames)
+            if num_frames >= sequence_length:
+                for i in range(0, num_frames - sequence_length + 1, sequence_step_size):
+                    sample_frames = frames[i:i+sequence_length]
+                    self.samples.append(sample_frames)
+            else:
+                print(f"Sequence {sid} is shorter than the sequence length ({num_frames} frames). Skipping.")
 
     def __len__(self):
-        return len(self.sequences)
+        return len(self.samples)
     
     def __getitem__(self, idx):
-        seq_number = list(self.sequences.keys())[idx]
-        sequence_data = self.sequences[seq_number]
+        sample_frames = self.samples[idx]
 
-        # Load all sequence images
+        # Load all sample images and events
         images = []
-        for image_name in sequence_data["images"]:
-            image_path = os.path.join(self.data_dir, image_name)
+        events = []
+
+        for _, img_filename, event_filename in sample_frames:
+            img_path = os.path.join(self.data_dir, img_filename)
+            event_path = os.path.join(self.data_dir, event_filename)
+            
             # Load image
-            image = Image.open(image_path)
+            image = Image.open(img_path).convert('RGB')
             if self.transform:
                 image = self.transform(image)
             images.append(image)
-
-        events = []
-        for event_name in sequence_data['events']:
-            event_path = os.path.join(self.data_dir, event_name)
+            
+            # Load events
             with open(event_path, 'r') as f:
-                event_data = json.load(f)
-            events.append(event_data)
-        
-        return images, torch.tensor(events, dtype=torch.float32)
+                event = json.load(f)
+            event = torch.tensor(event, dtype=torch.float32)
+            events.append(event)
 
+        # Stack images and events
+        images = torch.stack(images)  # Shape: (sequence_length, C, H, W)
+        events = torch.stack(events)  # Shape: (sequence_length, num_outputs)
+
+        return images, events
 
 # Define the ConvNeXt Tiny model for regression
 class ConvNeXtTinyRegression(nn.Module):
