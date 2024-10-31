@@ -43,8 +43,7 @@ class ForzaDataset(Dataset):
         
         # Load events
         with open(event_path, 'r') as f:
-            events = json.load(f)
-        
+            events = json.load(f) 
         events = torch.tensor(events, dtype=torch.float32)
         
         return image, events
@@ -152,7 +151,7 @@ class ForzaLSTMDataset(Dataset):
 class ConvNeXtTinyRegression(nn.Module):
     def __init__(self, num_outputs=7):
         super(ConvNeXtTinyRegression, self).__init__()
-        self.model = models.convnext_tiny(pretrained=True)
+        self.model = models.convnext_tiny(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
         # self.model.classifier
         self.model.classifier[2] = nn.Linear(self.model.classifier[2].in_features, num_outputs)
     
@@ -229,25 +228,32 @@ class ForzaLightning(L.LightningModule):
 
 
 def main():
+    # Load the config file
+    with open('config.json', 'r') as file:
+        config = json.load(file)
+
     # Training consts
-    SUPRESS_LOGS = False
-    NUM_EPOCHS = 100
+    SUPRESS_LOGS = config["suppress_logs"]
+    NUM_EPOCHS = config["num_epochs"]
 
     # Define transformations for the images
     transform = transforms.Compose([
-        transforms.Resize((64, 64)),
-        transforms.ToTensor()
+        # transforms.Resize((64, 64)),
+        # transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=config["normalize_mean"],
+                         std=config["normalize_std"]),
     ])
 
     # Create dataset and dataloader
-    data_dir = 'dataset'
+    data_dir = config["data_dir"]
     dataset = ForzaDataset(data_dir, transform=transform)
     # dataset = ForzaLSTMDataset(data_dir, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=config["shuffle"], num_workers=config["num_workers"])
 
     # Initialized WandB logger
     if not SUPRESS_LOGS:
-        wandb_logger = WandbLogger(project='forza-convnext-lstm')
+        wandb_logger = WandbLogger(project=config["wandb_dir"])
     else:
         wandb_logger = None
 
@@ -262,9 +268,9 @@ def main():
     trainer = L.Trainer(precision='16-mixed',
                         logger=wandb_logger,
                         max_epochs = NUM_EPOCHS,
-                        enable_checkpointing=True,
-                        deterministic=True,
-                        accelerator="cuda")
+                        enable_checkpointing=config["enable_checkpointing"],
+                        deterministic=config["deterministic"],
+                        accelerator=config["accelerator"])
     
     trainer.fit(model=forzalightning, train_dataloaders=dataloader)
 
