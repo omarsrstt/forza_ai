@@ -162,30 +162,29 @@ class ConvNeXtTinyRegression(nn.Module):
 class ConvNextTinyLSTMRegression(nn.Module):
     def __init__(self, num_outputs=7):
         super(ConvNextTinyLSTMRegression, self).__init__()
-        # Load the pre-trained ConvNeXt Tiny model
-        self.convnext = models.convnext_tiny(pretrained=True)
-        # Remove the final classification layer
+        # Load the ConvNeXt model
+        self.convnext = models.convnext_tiny(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        # Replace the final classification layer
         self.convnext.classifier = nn.Sequential(*list(self.convnext.classifier.children())[:-1])
         self.lstm = nn.LSTM(input_size=768, hidden_size=512, num_layers=1, batch_first=True)
         self.fc = nn.Linear(512, num_outputs)
     
     def forward(self, x):
-        # Apply CNN
-        seq_len, batch_size, C, H, W = x.shape
-        # batch_size, C, H, W = x.shape
-
-        convnext_out = []
-        for t in range(seq_len): # compute for each time step
-            out = self.convnext(x[t, :, :, :, :])
-            out = out.view(batch_size, -1)
-            convnext_out.append(out)
-        convnext_out = torch.stack(convnext_out, dim=1)
+        # Correct dimension unpacking: (batch_size, seq_len, C, H, W)
+        batch_size, seq_len, C, H, W = x.shape
+        
+        # Reshape to combine batch and sequence dimensions
+        x = x.view(batch_size * seq_len, C, H, W)  # (batch_size * seq_len, C, H, W)
+        
+        # Apply CNN to all images at once
+        convnext_out = self.convnext(x)  # (batch_size * seq_len, num_features)
+        convnext_out = convnext_out.view(batch_size, seq_len, -1)  # (batch_size, seq_len, num_features)
         
         # Apply LSTM
-        lstm_out, _ = self.lstm(convnext_out)
+        lstm_out, _ = self.lstm(convnext_out)  # (batch_size, seq_len, hidden_size)
         
-        # Apply final fully connected layer
-        out = self.fc(lstm_out[:, -1, :])
+        # Take the last timestep's output
+        out = self.fc(lstm_out[:, -1, :])  # (batch_size, num_outputs)
         return out
 
 class ForzaLightning(L.LightningModule):
@@ -206,9 +205,21 @@ class ForzaLightning(L.LightningModule):
         
         # Forward pass
         output_controls = self(images)
+
+        # If using LSTM, reduce controls to match output_controls shape
+        if isinstance(self.model, ConvNextTinyLSTMRegression):
+            controls = controls[:, -1, :]  # Take the last timestep of the sequence
         
+        # Split outputs and targets into boolean and continuous parts
+        output_bool = output_controls[:, :4]  # First 4 outputs (boolean)
+        output_cont = output_controls[:, 4:]  # Last 3 outputs (continuous)
+        target_bool = controls[:, :4]
+        target_cont = controls[:, 4:]
+
         # Loss calculation
-        loss = self.criterion(output_controls, controls)
+        bool_loss = nn.functional.binary_cross_entropy_with_logits(output_bool, target_bool)
+        cont_loss = nn.functional.mse_loss(output_cont, target_cont)
+        loss = bool_loss + cont_loss  # Combine losses        
         
         # Calculate metric
         mae = self.mae(output_controls, controls)
@@ -228,6 +239,9 @@ class ForzaLightning(L.LightningModule):
 
 
 def main():
+    # Clear previous cache before initiating training
+    torch.cuda.empty_cache()
+
     # Load the config file
     with open('config.json', 'r') as file:
         config = json.load(file)
@@ -245,21 +259,26 @@ def main():
                          std=config["normalize_std"]),
     ])
 
-    # Create dataset and dataloader
+    # Create dataset and dataloader & load model for training
     data_dir = config["data_dir"]
-    dataset = ForzaDataset(data_dir, transform=transform)
-    # dataset = ForzaLSTMDataset(data_dir, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=config["shuffle"], num_workers=config["num_workers"])
+    if config["LSTM"]:
+        dataset = ForzaLSTMDataset(data_dir, transform=transform)
+        model = ConvNextTinyLSTMRegression()
+    else:
+        dataset = ForzaDataset(data_dir, transform=transform)
+        model = ConvNeXtTinyRegression()
+    dataloader = DataLoader(dataset, 
+                            batch_size=config["batch_size"], 
+                            shuffle=config["shuffle"], 
+                            num_workers=config["num_workers"],
+                            persistent_workers=config["persistent_workers"],
+                            )
 
     # Initialized WandB logger
     if not SUPRESS_LOGS:
         wandb_logger = WandbLogger(project=config["wandb_dir"])
     else:
         wandb_logger = None
-
-    # Load model for training
-    model = ConvNeXtTinyRegression()
-    # model = ConvNextTinyLSTMRegression()
 
     # Use the forza lightning module
     forzalightning = ForzaLightning(model=model)
@@ -273,7 +292,6 @@ def main():
                         accelerator=config["accelerator"])
     
     trainer.fit(model=forzalightning, train_dataloaders=dataloader)
-
 
 if __name__ == "__main__":
     main()
