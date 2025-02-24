@@ -44,7 +44,9 @@ class ForzaDataset(Dataset):
         # Load events
         with open(event_path, 'r') as f:
             events = json.load(f) 
-        events = torch.tensor(events, dtype=torch.float32)
+        events = torch.tensor(events, 
+                              dtype=torch.float32,
+                              requires_grad=False)
         
         return image, events
     
@@ -56,7 +58,7 @@ class ForzaLSTMDataset(Dataset):
                  sequence_length: int = 100):
         self.data_dir = data_dir
         self.transform = transform
-        self.sequence_length = sequence_length
+        self.sequence_length = sequence_length # Number of frames in a sequence
         self.sequences = {}  # {sid: [(frame_id, img_filename, event_filename), ...]}
 
         # Regular expressions to extract sequence ID and frame ID
@@ -168,24 +170,38 @@ class ConvNextTinyLSTMRegression(nn.Module):
         self.convnext.classifier = nn.Sequential(*list(self.convnext.classifier.children())[:-1])
         self.lstm = nn.LSTM(input_size=768, hidden_size=512, num_layers=1, batch_first=True)
         self.fc = nn.Linear(512, num_outputs)
+
+        # Initialize LSTM hidden state
+        self.hidden_state = None
+
+    def reset_hidden_state(self):
+        # Reset hidden state at the start of a new sequence
+        self.hidden_state = None
     
     def forward(self, x):
-        # Correct dimension unpacking: (batch_size, seq_len, C, H, W)
-        batch_size, seq_len, C, H, W = x.shape
-        
-        # Reshape to combine batch and sequence dimensions
-        x = x.view(batch_size * seq_len, C, H, W)  # (batch_size * seq_len, C, H, W)
-        
-        # Apply CNN to all images at once
-        convnext_out = self.convnext(x)  # (batch_size * seq_len, num_features)
-        convnext_out = convnext_out.view(batch_size, seq_len, -1)  # (batch_size, seq_len, num_features)
-        
-        # Apply LSTM
-        lstm_out, _ = self.lstm(convnext_out)  # (batch_size, seq_len, hidden_size)
-        
-        # Take the last timestep's output
-        out = self.fc(lstm_out[:, -1, :])  # (batch_size, num_outputs)
-        return out
+        # Check if processing a sequence (training) or a single frame (live)
+        if x.dim() == 5:
+            # Training mode: process full sequence
+            # During training: x shape is (batch_size, seq_len, C, H, W)
+            batch_size, seq_len, C, H, W = x.shape # Unpacking dimensions
+            x = x.view(batch_size * seq_len, C, H, W)  # Reshape to combine batch and sequence dimensions
+            convnext_out = self.convnext(x) # Apply CNN to all images at once
+            convnext_out = convnext_out.view(batch_size, seq_len, -1) # Reshape to separate sequence and batch size
+            lstm_out, _ = self.lstm(convnext_out) # Apply LSTM
+            out = self.fc(lstm_out[:, -1, :]) # Take the last timestep's output
+            return out
+        else:
+            # Live mode: process one frame at a time (autoregressive)
+            # Extract features from the current frame
+            convnext_out = self.convnext(x)  # (batch_size, num_features)
+            convnext_out = convnext_out.unsqueeze(1)  # (batch_size, 1, num_features)
+            
+            # Pass through LSTM with previous hidden state
+            lstm_out, self.hidden_state = self.lstm(convnext_out, self.hidden_state)
+            
+            # Get prediction
+            out = self.fc(lstm_out[:, -1, :])  # (batch_size, num_outputs)
+            return out
 
 class ForzaLightning(L.LightningModule):
     def __init__(self, 
@@ -274,13 +290,14 @@ def main():
                             persistent_workers=config["persistent_workers"],
                             )
 
-    # Initialized WandB logger
+    # Initialize WandB logger
     if not SUPRESS_LOGS:
-        wandb_logger = WandbLogger(project=config["wandb_dir"])
+        wandb_logger = WandbLogger(project=config["wandb_dir"],
+                                   config = config)
     else:
         wandb_logger = None
 
-    # Use the forza lightning module
+    # Initialize the forza lightning module
     forzalightning = ForzaLightning(model=model)
 
     # Use lightning trainer for training
