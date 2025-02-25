@@ -55,7 +55,8 @@ class ForzaLSTMDataset(Dataset):
     def __init__(self, 
                  data_dir: str = "./dataset", 
                  transform = None,
-                 sequence_length: int = 100):
+                 sequence_length: int = 100,
+                 stride_length: int = None):
         self.data_dir = data_dir
         self.transform = transform
         self.sequence_length = sequence_length # Number of frames in a sequence
@@ -106,12 +107,13 @@ class ForzaLSTMDataset(Dataset):
 
         # Generate samples with fixed sequence length
         self.samples = []  # Each sample is a list of (img_path, event_path)
-        sequence_step_size = max(1, sequence_length//2)
+        if stride_length is None:
+            stride_length = max(1, sequence_length//2)
         for sid in self.sequences:
             frames = self.sequences[sid]
             num_frames = len(frames)
             if num_frames >= sequence_length:
-                for i in range(0, num_frames - sequence_length + 1, sequence_step_size):
+                for i in range(0, num_frames - sequence_length + 1, stride_length):
                     sample_frames = frames[i:i+sequence_length]
                     self.samples.append(sample_frames)
             else:
@@ -278,7 +280,10 @@ def main():
     # Create dataset and dataloader & load model for training
     data_dir = config["data_dir"]
     if config["LSTM"]:
-        dataset = ForzaLSTMDataset(data_dir, transform=transform)
+        dataset = ForzaLSTMDataset(data_dir,
+                                   transform=transform,
+                                   sequence_length = config["sequence_length"],
+                                   stride_length = config["stride_length"])
         model = ConvNextTinyLSTMRegression()
     else:
         dataset = ForzaDataset(data_dir, transform=transform)
