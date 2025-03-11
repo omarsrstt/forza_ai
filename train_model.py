@@ -170,7 +170,7 @@ class ConvNextTinyLSTMRegression(nn.Module):
         self.convnext = models.convnext_tiny(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
         # Replace the final classification layer
         self.convnext.classifier = nn.Sequential(*list(self.convnext.classifier.children())[:-1])
-        self.lstm = nn.LSTM(input_size=768, hidden_size=512, num_layers=1, batch_first=True)
+        self.lstm = nn.LSTM(input_size=768, hidden_size=512, num_layers=1,  dropout=0.3, batch_first=True)
         self.fc = nn.Linear(512, num_outputs)
 
         # Initialize LSTM hidden state
@@ -236,7 +236,8 @@ class ForzaLightning(L.LightningModule):
 
         # Loss calculation
         bool_loss = nn.functional.binary_cross_entropy_with_logits(output_bool, target_bool)
-        cont_loss = nn.functional.mse_loss(output_cont, target_cont)
+        # cont_loss = nn.functional.mse_loss(output_cont, target_cont)
+        cont_loss = nn.functional.huber_loss(output_cont, target_cont)
         loss = bool_loss + cont_loss  # Combine losses        
         
         # Calculate metric
@@ -251,8 +252,8 @@ class ForzaLightning(L.LightningModule):
         return self.model(x)
     
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer=optimizer, T_0=10)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=5e-4, weight_decay=1e-2)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer=optimizer, T_0=20)
         return [optimizer], [scheduler]
 
 
@@ -270,9 +271,11 @@ def main():
 
     # Define transformations for the images
     transform = transforms.Compose([
-        # transforms.Resize((64, 64)),
-        # transforms.Resize((224, 224)),
+        transforms.RandomRotation(degrees=5),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
         transforms.ToTensor(),
+        transforms.RandomErasing(p=0.5, scale=(0.02, 0.1)),  # Randomly erase 2-10% of the image
+        # transforms.Resize((224, 224)),
         transforms.Normalize(mean=config["normalize_mean"],
                          std=config["normalize_std"]),
     ])
@@ -309,6 +312,7 @@ def main():
     trainer = L.Trainer(precision='16-mixed',
                         logger=wandb_logger,
                         max_epochs = NUM_EPOCHS,
+                        gradient_clip_val = 0.5,
                         enable_checkpointing=config["enable_checkpointing"],
                         deterministic=config["deterministic"],
                         accelerator=config["accelerator"])
