@@ -1,0 +1,23 @@
+{
+    "MONITOR_REGION": {"top": 0, "left": 0, "width": 1920, "height": 1080}, 
+    "LSTM": true,
+    "MODEL_PATH": "forza-convnext-lstm/wj4use2z/checkpoints/epoch=19-step=72400.ckpt",
+    "RESIZE_DIMS": [224, 224],
+    "normalize_mean": [0.485, 0.456, 0.406],
+    "normalize_std": [0.229, 0.224, 0.225],
+
+    "suppress_logs": false,
+    "num_epochs": 20,
+    "data_dir": "dataset",
+    "dataset_type": "time",
+    "batch_size": 1,
+    "shuffle": true,
+    "num_workers": 2,
+    "wandb_dir": "forza-convnext-lstm",
+    "deterministic": false,
+    "accelerator": "cuda",
+    "enable_checkpointing": true,
+    "persistent_workers": true,
+    "sequence_length": 15,
+    "stride_length": 12
+}
