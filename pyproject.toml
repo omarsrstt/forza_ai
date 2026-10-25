@@ -19,6 +19,15 @@ dependencies = [
     "vgamepad>=0.1",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+# Modules live flat at the repo root; make them importable from tests/.
+pythonpath = ["."]
+
 [[tool.uv.index]]
 name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
