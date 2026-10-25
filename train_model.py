@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import numpy as np
 import wandb
 from PIL import Image
 from natsort import natsorted
@@ -14,6 +15,8 @@ from torch.utils.data import Dataset, DataLoader
 
 import lightning as L
 from lightning.pytorch.loggers import WandbLogger
+
+import preprocess
 
 class ForzaDataset(Dataset):
     def __init__(self, 
@@ -52,15 +55,18 @@ class ForzaDataset(Dataset):
     
 
 class ForzaLSTMDataset(Dataset):
-    def __init__(self, 
-                 data_dir: str = "./dataset", 
-                 transform = None,
-                 sequence_length: int = 100,
-                 stride_length: int = None):
+    def __init__(self,
+                 data_dir: str,
+                 transform,
+                 sequence_length: int,
+                 stride_length: int,
+                 split: dict,
+                 mode: str):
         self.data_dir = data_dir
         self.transform = transform
-        self.sequence_length = sequence_length # Number of frames in a sequence
-        self.sequences = {}  # {sid: [(frame_id, img_filename, event_filename), ...]}
+        self.sequence_length = sequence_length  # Number of frames in a window
+        self.stride_length = stride_length
+        self.sequences = {}  # {int_sid: [(int_fid, img_filename, event_filename), ...]}
 
         # Regular expressions to extract sequence ID and frame ID
         img_pattern = re.compile(r'seq_(\d+)_image_\d+_(\d+)\.(jpg|png)')
@@ -72,29 +78,28 @@ class ForzaLSTMDataset(Dataset):
         assert len(image_files) == len(event_files), "Number of images and event files must be the same"
 
         # Organize files by sequence ID
-        img_files_by_sid = {} # {sid: [(frame_id, img_filename), ...]}
+        img_files_by_sid = {}  # {int_sid: [(int_fid, img_filename), ...]}
         for img_file in image_files:
             match = img_pattern.match(img_file)
             if match:
                 sid, fid, _ = match.groups()
-                if sid not in img_files_by_sid:
-                    img_files_by_sid[sid] = []
-                img_files_by_sid[sid].append((int(fid), img_file))
+                img_files_by_sid.setdefault(int(sid), []).append((int(fid), img_file))
 
-        event_files_by_sid = {} # {sid: [(frame_id, event_filename), ...]}
+        event_files_by_sid = {}  # {int_sid: [(int_fid, event_filename), ...]}
         for event_file in event_files:
             match = event_pattern.match(event_file)
             if match:
                 sid, fid = match.groups()
-                if sid not in event_files_by_sid:
-                    event_files_by_sid[sid] = []
-                event_files_by_sid[sid].append((int(fid), event_file))
+                event_files_by_sid.setdefault(int(sid), []).append((int(fid), event_file))
 
-        # Combine image and event files, ensuring matching frame IDs
+        # Combine image and event files, keeping only sequences held out for this mode
+        selected_sids = {int(sid) for sid in split[mode]}
         for sid in img_files_by_sid:
+            if sid not in selected_sids:
+                continue
             if sid in event_files_by_sid:
-                img_frames = dict(img_files_by_sid[sid]) # {frame_id: img_filename}
-                event_frames = dict(event_files_by_sid[sid]) # {frame_id: event_filename}
+                img_frames = dict(img_files_by_sid[sid])  # {int_fid: img_filename}
+                event_frames = dict(event_files_by_sid[sid])  # {int_fid: event_filename}
                 common_fids = sorted(set(img_frames.keys()) & set(event_frames.keys()))
                 sequence = []
                 for fid in common_fids:
@@ -105,51 +110,47 @@ class ForzaLSTMDataset(Dataset):
             else:
                 print(f"Warning: No event files for sequence {sid}")
 
-        # Generate samples with fixed sequence length
-        self.samples = []  # Each sample is a list of (img_path, event_path)
-        if stride_length is None:
-            stride_length = max(1, sequence_length//2)
-        for sid in self.sequences:
+        # Generate windows, never crossing a sequence boundary
+        self.samples = []  # Each sample is a list of (img_filename, event_filename)
+        for sid in sorted(self.sequences):
             frames = self.sequences[sid]
             num_frames = len(frames)
-            if num_frames >= sequence_length:
-                for i in range(0, num_frames - sequence_length + 1, stride_length):
-                    sample_frames = frames[i:i+sequence_length]
-                    self.samples.append(sample_frames)
-            else:
+            if num_frames < sequence_length:
                 print(f"Sequence {sid} is shorter than the sequence length ({num_frames} frames). Skipping.")
+                continue
+            for i in range(0, num_frames - sequence_length + 1, stride_length):
+                self.samples.append([(img, event) for _, img, event in frames[i:i + sequence_length]])
 
     def __len__(self):
         return len(self.samples)
-    
+
     def __getitem__(self, idx):
         sample_frames = self.samples[idx]
 
-        # Load all sample images and events
+        # Load all sample images and dense physical labels
         images = []
-        events = []
+        labels = []
 
-        for _, img_filename, event_filename in sample_frames:
+        for img_filename, event_filename in sample_frames:
             img_path = os.path.join(self.data_dir, img_filename)
             event_path = os.path.join(self.data_dir, event_filename)
-            
+
             # Load image
             image = Image.open(img_path).convert('RGB')
             if self.transform:
                 image = self.transform(image)
             images.append(image)
-            
-            # Load events
+
+            # Load events and convert to physical labels
             with open(event_path, 'r') as f:
                 event = json.load(f)
-            event = torch.tensor(event, dtype=torch.float32)
-            events.append(event)
+            labels.append(preprocess.to_physical(np.array(event, dtype=np.float32)))
 
-        # Stack images and events
+        # Stack images and labels
         images = torch.stack(images)  # Shape: (sequence_length, C, H, W)
-        events = torch.stack(events)  # Shape: (sequence_length, num_outputs)
+        labels = torch.as_tensor(np.stack(labels), dtype=torch.float32)  # (sequence_length, 3)
 
-        return images, events
+        return images, labels
 
 # Define the ConvNeXt Tiny model for regression
 class ConvNeXtTinyRegression(nn.Module):
