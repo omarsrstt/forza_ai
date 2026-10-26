@@ -237,6 +237,19 @@ class ForzaLightning(L.LightningModule):
         return [optimizer], [scheduler]
 
 
+def load_forza_checkpoint(path: str, num_outputs: int = 3, map_location="cpu"):
+    # weights_only=False is required: real Lightning .ckpt files contain non-tensor
+    # objects (the old project checkpoint even pickles a model class). This is a
+    # locally-trusted file, never load checkpoints from untrusted sources.
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    state_dict = ckpt["state_dict"]
+    stripped = {k.split(".", 1)[1] if k.startswith("model.") else k: v
+                for k, v in state_dict.items()}
+    model = ConvNextTinyLSTMRegression(num_outputs=num_outputs)
+    model.load_state_dict(stripped, strict=True)
+    return model.eval(), ckpt.get("hyper_parameters", {})
+
+
 def main():
     # Clear previous cache before initiating training
     torch.cuda.empty_cache()
