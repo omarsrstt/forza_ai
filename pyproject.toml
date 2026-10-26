@@ -27,6 +27,13 @@ dev = [
 [tool.pytest.ini_options]
 # Modules live flat at the repo root; make them importable from tests/.
 pythonpath = ["."]
+# Lightning emits this benign message when a *_step method is unit-tested without a
+# Trainer. It is a framework artifact (Lightning itself documents that path as
+# supported) and guarding it in-module would require reaching into `self._trainer`,
+# so it is filtered here rather than in production code.
+filterwarnings = [
+    "ignore:You are trying to `self.log\\(\\)` but the `self.trainer` reference is not registered:UserWarning",
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu124"
