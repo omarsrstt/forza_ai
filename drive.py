@@ -1,16 +1,22 @@
 import cv2
 import time
 import json
+import pygame
 import keyboard
 import numpy as np
+from PIL import Image
 from mss import mss
-from record import start_buffer
-import matplotlib.pyplot as plt
 from gamepad import GamepadWriter
+from drive_cache import FrameWindow
 
 import torch
-import torch.nn.functional as F
-from train_model import ConvNeXtTinyRegression, ConvNextTinyLSTMRegression
+import preprocess
+import train_model
+
+# Training and inference must agree on frames per second and on the temporal
+# window, so both are fixed here rather than read from a second config copy.
+FPS_CAP = 15
+
 
 def check_pause(paused : bool):
     if keyboard.is_pressed('p'):
@@ -31,22 +37,20 @@ if __name__ == "__main__":
 
     paused = False
     gamepad_writer = GamepadWriter()
+    clock = pygame.time.Clock()
+
+    # Mirror the training pipeline exactly: RGB, INTER_AREA resize, no-jitter
+    # ToTensor + ImageNet Normalize. The normalisation constants come from
+    # preprocess so training and inference cannot drift apart.
+    transform = preprocess.build_train_transform(color_jitter=False)
 
     # Load the model
-    MODEL_PATH = config["MODEL_PATH"]
-    if config["LSTM"]:
-        model = ConvNextTinyLSTMRegression()
-        model.load_state_dict(torch.load(MODEL_PATH), strict=False)
-        model.reset_hidden_state()
-    else:
-        model = ConvNeXtTinyRegression()
-        model.load_state_dict(torch.load(MODEL_PATH), strict=False)
+    device = "cuda"
+    model, _ = train_model.load_forza_checkpoint(config["MODEL_PATH"])
+    model.eval().to(device)
 
-    # model.load_state_dict(torch.load(MODEL_PATH)['state_dict'])
-    model.eval().to("cuda")
-
-    # Add a small time buffer before the start
-    # start_buffer()
+    # Rolling window of per-frame CNN features; replaces any hidden state.
+    frame_window = FrameWindow(k=config["sequence_length"])
 
     with mss() as sct:
         with torch.no_grad():
@@ -65,39 +69,20 @@ if __name__ == "__main__":
                     paused = check_pause(paused)
                     time.sleep(0.1)  # Prevent busy waiting
 
-                # Get input screen capture
-                image = np.array(sct.grab(config["MONITOR_REGION"]))
-                # Convert to PyTorch tensor and remove alpha channel
-                torch_image = torch.from_numpy(image[:, :, :3]).float().to("cuda")  # Shape: (1080, 1920, 3)
+                # Grab the screen; mss returns BGRA, training JPEGs decode as RGB.
+                frame = np.array(sct.grab(config["MONITOR_REGION"]))
+                rgb = preprocess.rgb_from_bgra(frame)
+                rgb = cv2.resize(rgb, tuple(config["RESIZE_DIMS"]), interpolation=cv2.INTER_AREA)
+                x = transform(Image.fromarray(rgb)).unsqueeze(0).to(device)
 
-                # Resize and preprocess
-                torch_image = torch_image.permute(2, 0, 1).unsqueeze(0)  # HWC -> CHW, add batch dimension
-                torch_image = F.interpolate(torch_image, size=config["RESIZE_DIMS"], mode="bilinear", align_corners=False)  # Resize
-                mean = torch.tensor(config["normalize_mean"], device="cuda").view(1, 3, 1, 1)  # Normalize mean
-                std = torch.tensor(config["normalize_std"], device="cuda").view(1, 3, 1, 1)    # Normalize std
-                torch_image = (torch_image - mean) / std  # Normalize
+                # Encode only the newest frame, then run the LSTM over the window.
+                feature = model.encode(x).squeeze(0)
+                window = frame_window.push(feature)
+                outputs = model.forward_from_features(window)
 
-                # if config["LSTM"]:
-                    # torch_image = torch_image.unsqueeze(0)                        
+                # Physical outputs already: steer in [-1,1], throttle/brake in [0,1].
+                steer, throttle, brake = outputs[0, -1]
+                gamepad_writer.update(float(steer), float(throttle), float(brake))
 
-                # Forward pass
-                outputs = model(torch_image)
-
-                # Convert the tensor to a list
-                output_list = outputs[0].tolist()
-
-                ### Drive post processing ###
-                # Reduce impact of brakes
-                output_list[6] = output_list[6]/5 if output_list[6] != 0 else 0
-                # Increase impact of steering
-                output_list[4] = output_list[4]*10
-                # Ensure that the 3 trigger values are in the range [-1, 1]
-                output_list[4:] = [max(-1, min(1, num)) for num in output_list[4:]]
-                # First 4 elements are button inputs, i.e. boolean values
-                output_list[:4] = [int(np.round(x)) for x in output_list[:4]]
-                assert all(x in {0, 1} for x in output_list[:4]), f"Got an incorrect value for button press {output_list}"
-
-                print(output_list)
-
-                # Generate controls on this basis
-                gamepad_writer.update(output_list)
+                # Recorded frames were captured at 15 FPS, so drive at 15 FPS too.
+                clock.tick(FPS_CAP)
