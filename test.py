@@ -10,18 +10,16 @@ from gamepad import GamepadListener, GamepadWriter
 #         if keyboard.is_pressed('q'):
 #                 break
 
-def generate_random_events():
-    # Activate/Deactivate buttons
-    buttons = np.random.choice([0, 1], size=4)
-    # L-R Joystick
-    lr_joy = (np.random.random(size=1)-0.5)*2 # Generate float [-1, 1]
-    # Triggers
-    triggers = np.random.rand(2)
-    return np.concatenate((buttons, lr_joy, triggers))
+def generate_random_controls():
+    # L-R Joystick (steer)
+    steer = (np.random.random() - 0.5) * 2 # Generate float [-1, 1]
+    # Throttle / brake
+    throttle, brake = np.random.rand(2) # Generate floats [0, 1]
+    return steer, throttle, brake
 
 def test_gamepad_writer(gamepad_writer):
-    events = generate_random_events()
-    gamepad_writer.update(events=events)
+    steer, throttle, brake = generate_random_controls()
+    gamepad_writer.update(steer=steer, throttle=throttle, brake=brake)
 
 if __name__ == "__main__":
     gamepad_writer = GamepadWriter()
