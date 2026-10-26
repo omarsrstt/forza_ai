@@ -152,59 +152,38 @@ class ForzaLSTMDataset(Dataset):
 
         return images, labels
 
-# Define the ConvNeXt Tiny model for regression
-class ConvNeXtTinyRegression(nn.Module):
-    def __init__(self, num_outputs=7):
-        super(ConvNeXtTinyRegression, self).__init__()
-        self.model = models.convnext_tiny(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
-        # self.model.classifier
-        self.model.classifier[2] = nn.Linear(self.model.classifier[2].in_features, num_outputs)
-    
-    def forward(self, x):
-        return self.model(x)
-
-
 class ConvNextTinyLSTMRegression(nn.Module):
-    def __init__(self, num_outputs=7):
+    def __init__(self, num_outputs=3, hidden_size=512):
         super(ConvNextTinyLSTMRegression, self).__init__()
         # Load the ConvNeXt model
         self.convnext = models.convnext_tiny(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
-        # Replace the final classification layer
+        # Replace the final classification layer with LayerNorm2d + Flatten -> (N, 768) features
         self.convnext.classifier = nn.Sequential(*list(self.convnext.classifier.children())[:-1])
-        self.lstm = nn.LSTM(input_size=768, hidden_size=512, num_layers=1,  dropout=0.3, batch_first=True)
-        self.fc = nn.Linear(512, num_outputs)
+        # Freeze the first two stages of the backbone
+        for p in self.convnext.features[:2].parameters():
+            p.requires_grad = False
+        self.lstm = nn.LSTM(input_size=768, hidden_size=hidden_size, num_layers=1, batch_first=True)
+        self.fc = nn.Linear(hidden_size, num_outputs)
 
-        # Initialize LSTM hidden state
-        self.hidden_state = None
+    def encode(self, x):
+        # x: (N, C, H, W) -> (N, 768)
+        return self.convnext(x)
 
-    def reset_hidden_state(self):
-        # Reset hidden state at the start of a new sequence
-        self.hidden_state = None
-    
+    def forward_from_features(self, feat):
+        # feat: (B, k, 768) -> (B, k, num_outputs)
+        lstm_out, _ = self.lstm(feat)          # (B, k, hidden_size)
+        out = self.fc(lstm_out)                # (B, k, num_outputs)
+        steer = torch.tanh(out[..., 0])
+        throttle = torch.sigmoid(out[..., 1])
+        brake = torch.sigmoid(out[..., 2])
+        return torch.stack([steer, throttle, brake], dim=-1)
+
     def forward(self, x):
-        # Check if processing a sequence (training) or a single frame (live)
-        if x.dim() == 5:
-            # Training mode: process full sequence
-            # During training: x shape is (batch_size, seq_len, C, H, W)
-            batch_size, seq_len, C, H, W = x.shape # Unpacking dimensions
-            x = x.view(batch_size * seq_len, C, H, W)  # Reshape to combine batch and sequence dimensions
-            convnext_out = self.convnext(x) # Apply CNN to all images at once
-            convnext_out = convnext_out.view(batch_size, seq_len, -1) # Reshape to separate sequence and batch size
-            lstm_out, _ = self.lstm(convnext_out) # Apply LSTM
-            out = self.fc(lstm_out[:, -1, :]) # Take the last timestep's output
-            return out
-        else:
-            # Live mode: process one frame at a time (autoregressive)
-            # Extract features from the current frame
-            convnext_out = self.convnext(x)  # (batch_size, num_features)
-            convnext_out = convnext_out.unsqueeze(1)  # (batch_size, 1, num_features)
-            
-            # Pass through LSTM with previous hidden state
-            lstm_out, self.hidden_state = self.lstm(convnext_out, self.hidden_state)
-            
-            # Get prediction
-            out = self.fc(lstm_out[:, -1, :])  # (batch_size, num_outputs)
-            return out
+        # x: (B, k, C, H, W) -> (B, k, num_outputs), one prediction per timestep
+        batch_size, seq_len, C, H, W = x.shape
+        x = x.view(batch_size * seq_len, C, H, W)
+        features = self.encode(x).view(batch_size, seq_len, -1)  # (B, k, 768)
+        return self.forward_from_features(features)
 
 class ForzaLightning(L.LightningModule):
     def __init__(self, 
@@ -291,7 +270,7 @@ def main():
         model = ConvNextTinyLSTMRegression()
     else:
         dataset = ForzaDataset(data_dir, transform=transform)
-        model = ConvNeXtTinyRegression()
+        raise NotImplementedError("ConvNeXtTinyRegression was removed; only the LSTM model is supported")
     dataloader = DataLoader(dataset, 
                             batch_size=config["batch_size"], 
                             shuffle=config["shuffle"], 
