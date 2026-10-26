@@ -8,15 +8,15 @@ from natsort import natsorted
 
 import torch
 import torch.nn as nn
-import torch.nn as nn
-from torchmetrics.regression import MeanAbsoluteError
-from torchvision import transforms, models
+import torch.nn.functional as F
+from torchvision import models
 from torch.utils.data import Dataset, DataLoader
 
 import lightning as L
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 import preprocess
+import splits
 
 class ForzaDataset(Dataset):
     def __init__(self, 
@@ -185,56 +185,101 @@ class ConvNextTinyLSTMRegression(nn.Module):
         features = self.encode(x).view(batch_size, seq_len, -1)  # (B, k, 768)
         return self.forward_from_features(features)
 
+# Output channel order, matching preprocess.to_physical and the model's heads.
+CHANNELS = ("steer", "throttle", "brake")
+
+
 class ForzaLightning(L.LightningModule):
-    def __init__(self, 
-                 model):
+    """Dense-supervision wrapper around the ConvNeXt+LSTM regressor.
+
+    v1 supervised only the final timestep, which let the LSTM collapse to the
+    dataset mean while the loss went flat. Here every timestep of every window is
+    scored with Huber loss on the three physical channels, so each prediction in
+    the window gets a gradient.
+
+    Every hyperparameter has a default so the module can be constructed as
+    ``ForzaLightning(model)`` in tests; ``main`` passes the config values through.
+    """
+
+    def __init__(self,
+                 model,
+                 lr_backbone: float = 1e-4,
+                 lr_head: float = 5e-4,
+                 weight_decay: float = 1e-2,
+                 max_epochs: int = 30):
         super(ForzaLightning, self).__init__()
         self.model = model
-        self.criterion = torch.nn.MSELoss()
+        self.lr_backbone = lr_backbone
+        self.lr_head = lr_head
+        self.weight_decay = weight_decay
+        self.max_epochs = max_epochs
 
-        # Save hyperparameters (if any)
-        self.save_hyperparameters()
+        # The wrapped module is checkpointed as its own state_dict; keep it out of
+        # the hyperparameters dumped into the checkpoint.
+        self.save_hyperparameters(ignore=["model"])
 
-        # Initialize metrics
-        self.mae = MeanAbsoluteError()
-
-    def training_step(self, batch, batch_idx):
-        images, controls = batch
-        
-        # Forward pass
-        output_controls = self(images)
-
-        # If using LSTM, reduce controls to match output_controls shape
-        if isinstance(self.model, ConvNextTinyLSTMRegression):
-            controls = controls[:, -1, :]  # Take the last timestep of the sequence
-        
-        # Split outputs and targets into boolean and continuous parts
-        output_bool = output_controls[:, :4]  # First 4 outputs (boolean)
-        output_cont = output_controls[:, 4:]  # Last 3 outputs (continuous)
-        target_bool = controls[:, :4]
-        target_cont = controls[:, 4:]
-
-        # Loss calculation
-        bool_loss = nn.functional.binary_cross_entropy_with_logits(output_bool, target_bool)
-        # cont_loss = nn.functional.mse_loss(output_cont, target_cont)
-        cont_loss = nn.functional.huber_loss(output_cont, target_cont)
-        loss = bool_loss + cont_loss  # Combine losses        
-        
-        # Calculate metric
-        mae = self.mae(output_controls, controls)
-
-        # Logging
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('mae', mae, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        return loss
+        # Running sums for an exact epoch-level per-channel MAE. Accumulated in
+        # float64 on CPU so the metric does not drift with the AMP/device dtype.
+        self._val_abs_sum = torch.zeros(len(CHANNELS), dtype=torch.float64)
+        self._val_count = 0
 
     def forward(self, x):
         return self.model(x)
-    
+
+    def training_step(self, batch, batch_idx):
+        images, controls = batch
+        pred = self.model(images)  # (B, k, 3), one prediction per timestep
+        # Dense supervision: reduce over every timestep and channel, not [:, -1].
+        loss = F.huber_loss(pred, controls)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        images, controls = batch
+        pred = self.model(images)  # (B, k, 3)
+        abs_err = (pred.detach() - controls).abs()  # (B, k, 3)
+        mae = abs_err.mean(dim=(0, 1))  # per-channel mean over batch and time
+
+        self._val_abs_sum += abs_err.sum(dim=(0, 1)).cpu().double()
+        self._val_count += pred.shape[0] * pred.shape[1]
+
+        return {"mae": {name: mae[i].item() for i, name in enumerate(CHANNELS)}}
+
+    def on_validation_epoch_end(self):
+        if self._val_count == 0:
+            return
+        mae = self._val_abs_sum / self._val_count
+        for i, name in enumerate(CHANNELS):
+            self.log(f"val_mae_{name}", mae[i], prog_bar=(name == "steer"))
+        self._val_abs_sum.zero_()
+        self._val_count = 0
+
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=5e-4, weight_decay=1e-2)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer=optimizer, T_0=20)
-        return [optimizer], [scheduler]
+        # Two groups with discriminative LRs: the frozen first two ConvNeXt stages
+        # are skipped entirely, and the head trains faster than the backbone.
+        backbone_params, head_params = [], []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.startswith("convnext."):
+                backbone_params.append(param)
+            else:
+                head_params.append(param)
+
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": backbone_params, "lr": self.lr_backbone},
+                {"params": head_params, "lr": self.lr_head},
+            ],
+            weight_decay=self.weight_decay,
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(self.max_epochs, 1)
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+        }
 
 
 def load_forza_checkpoint(path: str, num_outputs: int = 3, map_location="cpu"):
@@ -250,6 +295,40 @@ def load_forza_checkpoint(path: str, num_outputs: int = 3, map_location="cpu"):
     return model.eval(), ckpt.get("hyper_parameters", {})
 
 
+def _cap_windows(dataset, max_windows):
+    """Truncate a dataset to at most ``max_windows`` windows, in place.
+
+    Used by the ``max_windows`` config knob to run a cheap dry run over a slice
+    of the data. ``samples`` (the flat window list) and ``sequences`` (the
+    per-sequence frames) are rebuilt together so they stay consistent, and whole
+    sequences are only ever partially consumed, never reordered.
+    """
+    if max_windows is None:
+        return
+    sequence_length = dataset.sequence_length
+    stride_length = dataset.stride_length
+    kept_sequences = {}
+    kept_samples = []
+    offset = 0
+    for sid in sorted(dataset.sequences):
+        frames = dataset.sequences[sid]
+        if len(frames) < sequence_length:
+            continue
+        remaining = max_windows - len(kept_samples)
+        if remaining <= 0:
+            break
+        num_windows = (len(frames) - sequence_length) // stride_length + 1
+        take = min(num_windows, remaining)
+        # Keep only the frames the retained windows actually read, so a partial
+        # take leaves no orphaned frames behind in ``sequences``.
+        used = (take - 1) * stride_length + sequence_length
+        kept_sequences[sid] = frames[:used]
+        kept_samples.extend(dataset.samples[offset:offset + take])
+        offset += num_windows
+    dataset.sequences = kept_sequences
+    dataset.samples = kept_samples
+
+
 def main():
     # Clear previous cache before initiating training
     torch.cuda.empty_cache()
@@ -258,59 +337,91 @@ def main():
     with open('config.json', 'r') as file:
         config = json.load(file)
 
-    # Training consts
-    SUPRESS_LOGS = config["suppress_logs"]
-    NUM_EPOCHS = config["num_epochs"]
-
-    # Define transformations for the images
-    transform = transforms.Compose([
-        transforms.RandomRotation(degrees=5),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.ToTensor(),
-        transforms.RandomErasing(p=0.5, scale=(0.02, 0.1)),  # Randomly erase 2-10% of the image
-        # transforms.Resize((224, 224)),
-        transforms.Normalize(mean=config["normalize_mean"],
-                         std=config["normalize_std"]),
-    ])
-
-    # Create dataset and dataloader & load model for training
     data_dir = config["data_dir"]
-    if config["LSTM"]:
-        dataset = ForzaLSTMDataset(data_dir,
-                                   transform=transform,
-                                   sequence_length = config["sequence_length"],
-                                   stride_length = config["stride_length"])
-        model = ConvNextTinyLSTMRegression()
+    sequence_length = config["sequence_length"]
+    stride_length = config["stride_length"]
+    batch_size = config["batch_size"]
+    num_workers = config["num_workers"]
+
+    # Persisted, whole-sequence train/val split so eval and training agree.
+    split = splits.load_or_create_split(
+        config["split_file"],
+        data_dir,
+        val_count=config["val_count"],
+        seed=config["split_seed"],
+    )
+
+    # Train with mild colour jitter; validate on the clean transform.
+    train_dataset = ForzaLSTMDataset(
+        data_dir,
+        transform=preprocess.build_train_transform(color_jitter=True),
+        sequence_length=sequence_length,
+        stride_length=stride_length,
+        split=split,
+        mode="train",
+    )
+    val_dataset = ForzaLSTMDataset(
+        data_dir,
+        transform=preprocess.build_train_transform(color_jitter=False),
+        sequence_length=sequence_length,
+        stride_length=stride_length,
+        split=split,
+        mode="val",
+    )
+
+    # Optional dry-run cap (config "max_windows"): train and validate on a
+    # bounded slice of windows instead of the whole dataset.
+    max_windows = config.get("max_windows")
+    _cap_windows(train_dataset, max_windows)
+    _cap_windows(val_dataset, max_windows)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+    )
+
+    model = ConvNextTinyLSTMRegression(num_outputs=3)
+    forzalightning = ForzaLightning(
+        model=model,
+        lr_backbone=config["lr_backbone"],
+        lr_head=config["lr_head"],
+        weight_decay=config["weight_decay"],
+        max_epochs=config["num_epochs"],
+    )
+
+    # Weights & Biases is opt-in: it blocks on an interactive auth prompt, which
+    # would stall an unattended overnight run. Default to plain local CSV logs.
+    if config.get("use_wandb", False):
+        logger = WandbLogger(project=config.get("wandb_dir", "forza-convnext-lstm"),
+                             config=config)
     else:
-        dataset = ForzaDataset(data_dir, transform=transform)
-        raise NotImplementedError("ConvNeXtTinyRegression was removed; only the LSTM model is supported")
-    dataloader = DataLoader(dataset, 
-                            batch_size=config["batch_size"], 
-                            shuffle=config["shuffle"], 
-                            num_workers=config["num_workers"],
-                            persistent_workers=config["persistent_workers"],
-                            )
+        logger = CSVLogger("logs", name="forza-convnext-lstm")
 
-    # Initialize WandB logger
-    if not SUPRESS_LOGS:
-        wandb_logger = WandbLogger(project=config["wandb_dir"],
-                                   config = config)
-    else:
-        wandb_logger = None
+    trainer = L.Trainer(
+        accelerator=config["accelerator"],
+        precision=config["precision"],
+        accumulate_grad_batches=config["accumulate_grad_batches"],
+        gradient_clip_val=0.5,
+        max_epochs=config["num_epochs"],
+        enable_checkpointing=config["enable_checkpointing"],
+        logger=logger,
+        num_sanity_val_steps=config.get("num_sanity_val_steps", 0),
+    )
 
-    # Initialize the forza lightning module
-    forzalightning = ForzaLightning(model=model)
+    trainer.fit(model=forzalightning,
+                train_dataloaders=train_loader,
+                val_dataloaders=val_loader)
 
-    # Use lightning trainer for training
-    trainer = L.Trainer(precision='16-mixed',
-                        logger=wandb_logger,
-                        max_epochs = NUM_EPOCHS,
-                        gradient_clip_val = 0.5,
-                        enable_checkpointing=config["enable_checkpointing"],
-                        deterministic=config["deterministic"],
-                        accelerator=config["accelerator"])
-    
-    trainer.fit(model=forzalightning, train_dataloaders=dataloader)
 
 if __name__ == "__main__":
     main()
