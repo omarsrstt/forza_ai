@@ -282,7 +282,9 @@ class ForzaLightning(L.LightningModule):
         }
 
 
-def load_forza_checkpoint(path: str, num_outputs: int = 3, map_location="cpu"):
+def load_forza_checkpoint(
+    path: str, num_outputs: int = 3, map_location="cpu"
+) -> tuple[nn.Module, dict]:
     # weights_only=False is required: real Lightning .ckpt files contain non-tensor
     # objects (the old project checkpoint even pickles a model class). This is a
     # locally-trusted file, never load checkpoints from untrusted sources.
