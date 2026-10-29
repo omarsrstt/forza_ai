@@ -13,6 +13,7 @@ from torchvision import models
 from torch.utils.data import Dataset, DataLoader
 
 import lightning as L
+from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 import preprocess
@@ -409,6 +410,24 @@ def main():
     else:
         logger = CSVLogger("logs", name="forza-convnext-lstm")
 
+    # Explicit checkpointing: the default callback under WandbLogger saved nothing
+    # recoverable in the first 7 epochs of the 2026-10-27 run (which then died with
+    # zero checkpoints), so pin the dir, save every epoch, and keep a rolling last.ckpt.
+    ckpt_dir = os.path.join("logs", "checkpoints")
+    checkpoint_cb = ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename="epoch{epoch:02d}-step{step}",
+        every_n_epochs=1,
+        save_top_k=-1,
+        save_last=True,
+        auto_insert_metric_name=False,
+    )
+    resume_path = None
+    last = os.path.join(ckpt_dir, "last.ckpt")
+    if config.get("resume_from_last", False) and os.path.exists(last):
+        resume_path = last
+        print(f"[resume] continuing from {last}")
+
     trainer = L.Trainer(
         accelerator=config["accelerator"],
         precision=config["precision"],
@@ -418,11 +437,13 @@ def main():
         enable_checkpointing=config["enable_checkpointing"],
         logger=logger,
         num_sanity_val_steps=config.get("num_sanity_val_steps", 0),
+        callbacks=[checkpoint_cb],
     )
 
     trainer.fit(model=forzalightning,
                 train_dataloaders=train_loader,
-                val_dataloaders=val_loader)
+                val_dataloaders=val_loader,
+                ckpt_path=resume_path)
 
 
 if __name__ == "__main__":

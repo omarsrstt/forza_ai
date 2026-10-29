@@ -11,9 +11,12 @@
   "val_count": 3,
   "split_seed": 0,
   "split_file": "split.json",
+  "snapshot": "logs/checkpoints/last.ckpt",
   "num_workers": 2,
   "accelerator": "cuda",
   "precision": "16-mixed",
   "enable_checkpointing": true,
+  "use_wandb": true,
+  "resume_from_last": false,
   "max_windows": null
 }
