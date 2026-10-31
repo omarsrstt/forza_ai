@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import random
 import numpy as np
 import wandb
 from PIL import Image
@@ -62,11 +63,21 @@ class ForzaLSTMDataset(Dataset):
                  sequence_length: int,
                  stride_length: int,
                  split: dict,
-                 mode: str):
+                 mode: str,
+                 shift_max_frac: float = 0.0,
+                 steer_shift_gain: float = 2.5,
+                 rng=None):
         self.data_dir = data_dir
         self.transform = transform
         self.sequence_length = sequence_length  # Number of frames in a window
         self.stride_length = stride_length
+        self.mode = mode
+        # Steering-offset augmentation is off by default (0.0) so validation,
+        # offline evaluation and the live driver all see the real distribution.
+        # It is additionally gated on mode == "train" as a second safeguard.
+        self.shift_max_frac = float(shift_max_frac)
+        self.steer_shift_gain = float(steer_shift_gain)
+        self.rng = rng if rng is not None else random.Random()
         self.sequences = {}  # {int_sid: [(int_fid, img_filename, event_filename), ...]}
 
         # Regular expressions to extract sequence ID and frame ID
@@ -128,6 +139,14 @@ class ForzaLSTMDataset(Dataset):
     def __getitem__(self, idx):
         sample_frames = self.samples[idx]
 
+        # One camera offset for the whole window, applied to every frame, with
+        # the matching steering correction on every label. Sampling per frame
+        # instead would break the correspondence between image and label.
+        augmenting = self.mode == "train" and self.shift_max_frac > 0.0
+        shift = (
+            preprocess.sample_shift(self.rng, self.shift_max_frac) if augmenting else 0.0
+        )
+
         # Load all sample images and dense physical labels
         images = []
         labels = []
@@ -138,6 +157,8 @@ class ForzaLSTMDataset(Dataset):
 
             # Load image
             image = Image.open(img_path).convert('RGB')
+            if augmenting:
+                image = preprocess.shift_image(image, shift)
             if self.transform:
                 image = self.transform(image)
             images.append(image)
@@ -145,7 +166,18 @@ class ForzaLSTMDataset(Dataset):
             # Load events and convert to physical labels
             with open(event_path, 'r') as f:
                 event = json.load(f)
-            labels.append(preprocess.to_physical(np.array(event, dtype=np.float32)))
+            physical = preprocess.to_physical(np.array(event, dtype=np.float32))
+            if augmenting:
+                physical = physical.copy()
+                physical[0] = float(
+                    np.clip(
+                        physical[0]
+                        + preprocess.steer_offset_for_shift(shift, self.steer_shift_gain),
+                        -1.0,
+                        1.0,
+                    )
+                )
+            labels.append(physical)
 
         # Stack images and labels
         images = torch.stack(images)  # Shape: (sequence_length, C, H, W)
@@ -189,6 +221,13 @@ class ConvNextTinyLSTMRegression(nn.Module):
 # Output channel order, matching preprocess.to_physical and the model's heads.
 CHANNELS = ("steer", "throttle", "brake")
 
+# Huber transition point. torch's default delta=1.0 spans the whole target range
+# of [-1, 1], so the linear (robust) region never activates and the loss is
+# mathematically plain MSE -- which is why v1's "Huber" behaved like squared
+# error on the ~95%-zero brake channel. 0.2 keeps typical errors quadratic while
+# making genuinely large errors (rare hard brakes, label noise) linear.
+DEFAULT_HUBER_DELTA = 0.2
+
 
 class ForzaLightning(L.LightningModule):
     """Dense-supervision wrapper around the ConvNeXt+LSTM regressor.
@@ -207,13 +246,15 @@ class ForzaLightning(L.LightningModule):
                  lr_backbone: float = 1e-4,
                  lr_head: float = 5e-4,
                  weight_decay: float = 1e-2,
-                 max_epochs: int = 30):
+                 max_epochs: int = 30,
+                 huber_delta: float = DEFAULT_HUBER_DELTA):
         super(ForzaLightning, self).__init__()
         self.model = model
         self.lr_backbone = lr_backbone
         self.lr_head = lr_head
         self.weight_decay = weight_decay
         self.max_epochs = max_epochs
+        self.huber_delta = huber_delta
 
         # The wrapped module is checkpointed as its own state_dict; keep it out of
         # the hyperparameters dumped into the checkpoint.
@@ -227,11 +268,15 @@ class ForzaLightning(L.LightningModule):
     def forward(self, x):
         return self.model(x)
 
+    def _loss(self, pred, target):
+        """Dense Huber over every timestep and channel, at ``self.huber_delta``."""
+        return F.huber_loss(pred, target, delta=self.huber_delta)
+
     def training_step(self, batch, batch_idx):
         images, controls = batch
         pred = self.model(images)  # (B, k, 3), one prediction per timestep
         # Dense supervision: reduce over every timestep and channel, not [:, -1].
-        loss = F.huber_loss(pred, controls)
+        loss = self._loss(pred, controls)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
 
@@ -354,7 +399,8 @@ def main():
         seed=config["split_seed"],
     )
 
-    # Train with mild colour jitter; validate on the clean transform.
+    # Train with mild colour jitter and steering-offset augmentation; validate on
+    # the clean transform with no augmentation so val stays the real distribution.
     train_dataset = ForzaLSTMDataset(
         data_dir,
         transform=preprocess.build_train_transform(color_jitter=True),
@@ -362,6 +408,8 @@ def main():
         stride_length=stride_length,
         split=split,
         mode="train",
+        shift_max_frac=config.get("shift_max_frac", 0.0),
+        steer_shift_gain=config.get("steer_shift_gain", 2.5),
     )
     val_dataset = ForzaLSTMDataset(
         data_dir,
@@ -400,6 +448,7 @@ def main():
         lr_head=config["lr_head"],
         weight_decay=config["weight_decay"],
         max_epochs=config["num_epochs"],
+        huber_delta=config.get("huber_delta", DEFAULT_HUBER_DELTA),
     )
 
     # Weights & Biases is opt-in: it blocks on an interactive auth prompt, which

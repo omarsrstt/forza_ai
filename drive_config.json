@@ -18,6 +18,6 @@
     "accelerator": "cuda",
     "enable_checkpointing": true,
     "persistent_workers": true,
-    "sequence_length": 15,
+    "sequence_length": 24,
     "stride_length": 12
 }

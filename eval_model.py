@@ -29,6 +29,14 @@ CHANNELS = ("steer", "throttle", "brake")
 # regardless of its MAE, so both thresholds must be cleared.
 SENSITIVITY_THRESHOLD = 0.05
 
+# Calibration bar for steering. MAE and R2 are both blind to a shrunken
+# predictor: a model that always outputs half the demanded lock is perfectly
+# correlated (R2 = 1.0) and beats the constant baseline, yet it understeers off
+# every corner. The measured on-car failure was slope 0.63 against slope 1.00 on
+# training clips, so the slope is what has to be gated.
+SLOPE_MIN = 0.85
+R2_MIN = 0.75
+
 
 def _windows(dataset):
     """Yield ``(images, labels)`` items one at a time.
@@ -105,6 +113,56 @@ def _format(scores):
     return "{" + ", ".join(f"{name}: {value:.4f}" for name, value in scores.items()) + "}"
 
 
+def calibration_stats(model, loader, device="cpu"):
+    """Per-channel ``(slope, r2)`` of ``pred`` against ``true``.
+
+    ``slope`` is the least-squares coefficient ``a`` in ``pred = a*true + b``.
+    ``a < 1`` means the model systematically under-commands the channel: it moves
+    in the right direction but not far enough. This is invisible to MAE (which
+    mixes shrink with noise) and invisible to R2 (correlation is invariant to
+    scaling), so it has to be measured separately. ``a == 0`` with ``r2 == 0``
+    means the channel is constant.
+
+    Returns ``{name: (slope, r2)}``.
+    """
+    preds, trues = [], []
+    with torch.no_grad():
+        for images, labels in _windows(loader):
+            pred = model(images.unsqueeze(0).to(device))
+            preds.append(pred.reshape(-1, len(CHANNELS)).detach().cpu().double())
+            trues.append(labels.reshape(-1, len(CHANNELS)).double())
+    if not preds:
+        return {name: (0.0, 0.0) for name in CHANNELS}
+    pred = torch.cat(preds, dim=0)  # (N, 3)
+    true = torch.cat(trues, dim=0)  # (N, 3)
+
+    stats = {}
+    for i, name in enumerate(CHANNELS):
+        t, p = true[:, i], pred[:, i]
+        tc = t - t.mean()
+        denom = float((tc * tc).sum())
+        slope = float((tc * (p - p.mean())).sum()) / denom if denom > 0 else 0.0
+        pc = p - p.mean()
+        corr_denom = float(tc.norm() * pc.norm())
+        corr = float((tc * pc).sum()) / corr_denom if corr_denom > 0 else 0.0
+        stats[name] = (slope, corr * corr)
+    return stats
+
+
+def meets_bar(model_mae, baseline_mae, sensitivity, calibration):
+    """Decide PASS/FAIL. Pure, so the printed verdict and tests cannot drift."""
+    checks = {
+        "steer_beats_baseline": model_mae["steer"] < baseline_mae["steer"],
+        "steer_responsive": sensitivity["steer"] > SENSITIVITY_THRESHOLD,
+        "throttle_responsive": sensitivity["throttle"] > SENSITIVITY_THRESHOLD,
+        "steer_calibration": (
+            calibration["steer"][0] >= SLOPE_MIN
+            and calibration["steer"][1] >= R2_MIN
+        ),
+    }
+    return all(checks.values()), checks
+
+
 def main():
     with open("config.json") as f:
         config = json.load(f)
@@ -132,20 +190,24 @@ def main():
     model_mae = per_channel_mae(model, val_dataset)
     baseline_mae = constant_baseline_mae(val_dataset)
     sensitivity = input_sensitivity(model, val_dataset)
+    calibration = calibration_stats(model, val_dataset)
 
     print(f"model MAE:      {_format(model_mae)}")
     print(f"baseline MAE:   {_format(baseline_mae)}")
     print(f"sensitivity:    {_format(sensitivity)}")
+    print("calibration:    {" + ", ".join(
+        f"{n}: slope={calibration[n][0]:.3f} r2={calibration[n][1]:.3f}" for n in CHANNELS
+    ) + "}")
 
-    beats_baseline = model_mae["steer"] < baseline_mae["steer"]
-    responsive = (
-        sensitivity["steer"] > SENSITIVITY_THRESHOLD
-        and sensitivity["throttle"] > SENSITIVITY_THRESHOLD
-    )
-    passed = beats_baseline and responsive
-    print(f"steer beats constant baseline: {beats_baseline}")
+    passed, checks = meets_bar(model_mae, baseline_mae, sensitivity, calibration)
+    print(f"steer beats constant baseline: {checks['steer_beats_baseline']}")
     print(
-        f"input sensitivity > {SENSITIVITY_THRESHOLD} on steer and throttle: {responsive}"
+        f"input sensitivity > {SENSITIVITY_THRESHOLD} on steer and throttle: "
+        f"{checks['steer_responsive'] and checks['throttle_responsive']}"
+    )
+    print(
+        f"steer calibration slope >= {SLOPE_MIN} and R2 >= {R2_MIN}: "
+        f"{checks['steer_calibration']}"
     )
     print("PASS" if passed else "FAIL")
 
