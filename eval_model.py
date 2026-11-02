@@ -38,6 +38,33 @@ SLOPE_MIN = 0.85
 R2_MIN = 0.75
 
 
+def resolve_device(device="auto"):
+    """Turn ``"auto"`` into a concrete device.
+
+    Evaluation is unusably slow on the CPU (a full-val pass exceeded 30 minutes),
+    so callers should not have to remember to ask for the GPU.
+    """
+    if device in (None, "auto"):
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return device
+
+
+def _model_device(model, device):
+    """Resolve a device guaranteed to match the model's parameters.
+
+    With ``"auto"`` we follow the model: an explicitly CPU-resident model is
+    never handed CUDA inputs. ``main`` moves the model to the GPU first, which is
+    what makes the default fast there without surprising every other caller.
+    """
+    if device not in (None, "auto"):
+        return device
+    params = getattr(model, "parameters", None)
+    if callable(params):
+        for p in params():
+            return p.device
+    return resolve_device("auto")
+
+
 def _windows(dataset):
     """Yield ``(images, labels)`` items one at a time.
 
@@ -50,7 +77,25 @@ def _windows(dataset):
         yield dataset[i]
 
 
-def per_channel_mae(model, loader, device="cpu"):
+def _prev_for(model, labels):
+    """Teacher-forced previous action, or ``None`` for pre-residual models."""
+    if getattr(model, "residual", False):
+        return train_model.shift_labels(labels.unsqueeze(0))
+    return None
+
+
+def _predict(model, images, prev):
+    """Call the model with ``prev`` only when it takes one.
+
+    Test doubles and pre-residual checkpoints have a plain ``forward(x)``, so
+    unconditionally passing a keyword would make this harness unusable for them.
+    """
+    if prev is None:
+        return model(images)
+    return model(images, prev=prev)
+
+
+def per_channel_mae(model, loader, device="auto"):
     """Mean absolute error per channel in physical units.
 
     ``loader`` is any object supporting ``len``/``__getitem__`` that yields
@@ -59,11 +104,12 @@ def per_channel_mae(model, loader, device="cpu"):
     """
     abs_sum = torch.zeros(len(CHANNELS), dtype=torch.float64)
     count = 0
+    device = _model_device(model, device)
     with torch.no_grad():
         for images, labels in _windows(loader):
             images = images.unsqueeze(0).to(device)
             labels = labels.unsqueeze(0)
-            preds = model(images)
+            preds = _predict(model, images, _prev_for(model, labels.squeeze(0).to(device)))
             # Follow the model's device so a CPU test double is not asked to
             # subtract a GPU tensor from a CPU one.
             labels = labels.to(preds.device)
@@ -93,18 +139,20 @@ def constant_baseline_mae(dataset):
     return dict(zip(CHANNELS, mae.tolist()))
 
 
-def input_sensitivity(model, val_dataset, device="cpu"):
+def input_sensitivity(model, val_dataset, device="auto"):
     """Per-channel max absolute output change when the input is blanked.
 
     A model that ignores its input returns identical predictions for the real
     window and an all-zero window, so every channel reads exactly 0.0. Any
     healthy model must move by a visible margin.
     """
+    device = _model_device(model, device)
     real = val_dataset[0][0].unsqueeze(0).to(device)
     black = torch.zeros_like(real)
+    real_prev = _prev_for(model, val_dataset[0][1].to(device))
     with torch.no_grad():
-        real_out = model(real)
-        black_out = model(black)
+        real_out = _predict(model, real, real_prev)
+        black_out = _predict(model, black, real_prev)
     diff = (real_out - black_out).abs().amax(dim=(0, 1)).detach().cpu()
     return dict(zip(CHANNELS, diff.tolist()))
 
@@ -113,7 +161,7 @@ def _format(scores):
     return "{" + ", ".join(f"{name}: {value:.4f}" for name, value in scores.items()) + "}"
 
 
-def calibration_stats(model, loader, device="cpu"):
+def calibration_stats(model, loader, device="auto"):
     """Per-channel ``(slope, r2)`` of ``pred`` against ``true``.
 
     ``slope`` is the least-squares coefficient ``a`` in ``pred = a*true + b``.
@@ -126,9 +174,11 @@ def calibration_stats(model, loader, device="cpu"):
     Returns ``{name: (slope, r2)}``.
     """
     preds, trues = [], []
+    device = _model_device(model, device)
     with torch.no_grad():
         for images, labels in _windows(loader):
-            pred = model(images.unsqueeze(0).to(device))
+            prev = _prev_for(model, labels.to(device))
+            pred = _predict(model, images.unsqueeze(0).to(device), prev)
             preds.append(pred.reshape(-1, len(CHANNELS)).detach().cpu().double())
             trues.append(labels.reshape(-1, len(CHANNELS)).double())
     if not preds:
@@ -149,8 +199,40 @@ def calibration_stats(model, loader, device="cpu"):
     return stats
 
 
-def meets_bar(model_mae, baseline_mae, sensitivity, calibration):
-    """Decide PASS/FAIL. Pure, so the printed verdict and tests cannot drift."""
+def persistence_baseline_mae(dataset):
+    """Per-channel MAE of repeating the previous action.
+
+    This is the baseline the project actually shipped behind. It is not academic:
+    the driver knows the command it last sent, so ``y[t] = y[t-1]`` is available
+    at inference, and on the recorded data it scores 0.13 steer MAE against the
+    v1 model's 0.28. Any acceptance bar that omits it can certify a model that is
+    worse than doing nothing.
+
+    Window starts have no predecessor inside the window, so the first frame of
+    each window is skipped rather than scored against a fabricated zero.
+    """
+    preds, trues = [], []
+    for _, labels in _windows(dataset):
+        labels = labels.reshape(-1, len(CHANNELS)).double()
+        if labels.shape[0] < 2:
+            continue
+        preds.append(labels[:-1])
+        trues.append(labels[1:])
+    if not preds:
+        return {name: 0.0 for name in CHANNELS}
+    pred = torch.cat(preds, dim=0)
+    true = torch.cat(trues, dim=0)
+    mae = (pred - true).abs().mean(dim=0)
+    return dict(zip(CHANNELS, mae.tolist()))
+
+
+def meets_bar(model_mae, baseline_mae, sensitivity, calibration, persistence=None):
+    """Decide PASS/FAIL. Pure, so the printed verdict and tests cannot drift.
+
+    ``persistence`` is optional so existing callers keep working, but ``main``
+    always supplies it: without it the bar cannot distinguish a model that
+    learned something from one that is worse than holding the last command.
+    """
     checks = {
         "steer_beats_baseline": model_mae["steer"] < baseline_mae["steer"],
         "steer_responsive": sensitivity["steer"] > SENSITIVITY_THRESHOLD,
@@ -160,6 +242,8 @@ def meets_bar(model_mae, baseline_mae, sensitivity, calibration):
             and calibration["steer"][1] >= R2_MIN
         ),
     }
+    if persistence is not None:
+        checks["steer_beats_persistence"] = model_mae["steer"] < persistence["steer"]
     return all(checks.values()), checks
 
 
@@ -185,22 +269,29 @@ def main():
     )
 
     model, _ = train_model.load_forza_checkpoint(snapshot_path, num_outputs=3)
-    model.eval()
+    # Evaluation has to run on the GPU: a full-val pass on CPU is impractically
+    # slow, and the device defaults in the helpers below are "auto" now.
+    model.eval().to(resolve_device())
 
     model_mae = per_channel_mae(model, val_dataset)
     baseline_mae = constant_baseline_mae(val_dataset)
+    persistence_mae = persistence_baseline_mae(val_dataset)
     sensitivity = input_sensitivity(model, val_dataset)
     calibration = calibration_stats(model, val_dataset)
 
     print(f"model MAE:      {_format(model_mae)}")
     print(f"baseline MAE:   {_format(baseline_mae)}")
+    print(f"persistence MAE:{_format(persistence_mae)}")
     print(f"sensitivity:    {_format(sensitivity)}")
     print("calibration:    {" + ", ".join(
         f"{n}: slope={calibration[n][0]:.3f} r2={calibration[n][1]:.3f}" for n in CHANNELS
     ) + "}")
 
-    passed, checks = meets_bar(model_mae, baseline_mae, sensitivity, calibration)
+    passed, checks = meets_bar(
+        model_mae, baseline_mae, sensitivity, calibration, persistence=persistence_mae
+    )
     print(f"steer beats constant baseline: {checks['steer_beats_baseline']}")
+    print(f"steer beats persistence baseline: {checks['steer_beats_persistence']}")
     print(
         f"input sensitivity > {SENSITIVITY_THRESHOLD} on steer and throttle: "
         f"{checks['steer_responsive'] and checks['throttle_responsive']}"

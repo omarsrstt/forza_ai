@@ -25,7 +25,7 @@ def test_input_sensitivity_fresh_model_is_nonzero():
     # unseeded assertion is flaky. Seed 2 yields ~0.12 for this exact model +
     # input pair, a deterministic 2.5x margin above the threshold.
     torch.manual_seed(2)
-    m = train_model.ConvNextTinyLSTMRegression(3).eval()
+    m = train_model.ConvNextTinyLSTMRegression(3, residual=False).eval()
     ds = _FakeDS()
     assert eval_model.input_sensitivity(m, ds)["steer"] > 0.05
 

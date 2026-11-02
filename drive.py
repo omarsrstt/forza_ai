@@ -52,6 +52,11 @@ if __name__ == "__main__":
     # Rolling window of per-frame CNN features; replaces any hidden state.
     frame_window = FrameWindow(k=config["sequence_length"])
 
+    # The residual head predicts a correction to the last command actually sent,
+    # so the driver has to remember it. Zero is the correct start: the car is
+    # stationary with the wheel centred when the script begins.
+    prev_action = torch.zeros(1, 1, 3, device=device)
+
     with mss() as sct:
         with torch.no_grad():
             while True:
@@ -78,11 +83,15 @@ if __name__ == "__main__":
                 # Encode only the newest frame, then run the LSTM over the window.
                 feature = model.encode(x).squeeze(0)
                 window = frame_window.push(feature)
-                outputs = model.forward_from_features(window)
+                # Predict from the command issued last tick, so the head only has
+                # to learn the correction. Reading the last output keeps the
+                # zero-padding for t<k out of the car's controls.
+                outputs = model.forward_from_features(window, prev=prev_action)
 
                 # Physical outputs already: steer in [-1,1], throttle/brake in [0,1].
                 steer, throttle, brake = outputs[0, -1]
                 gamepad_writer.update(float(steer), float(throttle), float(brake))
+                prev_action = outputs[:, -1:].detach()
 
                 # Recorded frames were captured at 15 FPS, so drive at 15 FPS too.
                 clock.tick(FPS_CAP)

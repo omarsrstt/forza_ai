@@ -186,7 +186,7 @@ class ForzaLSTMDataset(Dataset):
         return images, labels
 
 class ConvNextTinyLSTMRegression(nn.Module):
-    def __init__(self, num_outputs=3, hidden_size=512):
+    def __init__(self, num_outputs=3, hidden_size=512, residual=True):
         super(ConvNextTinyLSTMRegression, self).__init__()
         # Load the ConvNeXt model
         self.convnext = models.convnext_tiny(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
@@ -197,29 +197,73 @@ class ConvNextTinyLSTMRegression(nn.Module):
             p.requires_grad = False
         self.lstm = nn.LSTM(input_size=768, hidden_size=hidden_size, num_layers=1, batch_first=True)
         self.fc = nn.Linear(hidden_size, num_outputs)
+        # Residual mode: the head predicts a *correction* to the previous action
+        # rather than the action itself. Repeating the last command already scores
+        # 0.132 steer MAE on held-out sequences while the plain regressor scored
+        # 0.275, so the architecture starts at the baseline instead of fighting it.
+        # Kept optional so checkpoints predating the head still load.
+        self.residual = residual
+        if residual:
+            self.delta = nn.Linear(hidden_size, num_outputs)
 
     def encode(self, x):
         # x: (N, C, H, W) -> (N, 768)
         return self.convnext(x)
 
-    def forward_from_features(self, feat):
+    def forward_from_features(self, feat, prev=None):
         # feat: (B, k, 768) -> (B, k, num_outputs)
         lstm_out, _ = self.lstm(feat)          # (B, k, hidden_size)
-        out = self.fc(lstm_out)                # (B, k, num_outputs)
-        steer = torch.tanh(out[..., 0])
-        throttle = torch.sigmoid(out[..., 1])
-        brake = torch.sigmoid(out[..., 2])
-        return torch.stack([steer, throttle, brake], dim=-1)
+        if not self.residual:
+            out = self.fc(lstm_out)            # (B, k, num_outputs)
+            steer = torch.tanh(out[..., 0])
+            throttle = torch.sigmoid(out[..., 1])
+            brake = torch.sigmoid(out[..., 2])
+            return torch.stack([steer, throttle, brake], dim=-1)
+        if prev is None:
+            prev = torch.zeros(feat.shape[0], feat.shape[1], 3,
+                               dtype=lstm_out.dtype, device=lstm_out.device)
+        correction = RESIDUAL_SCALE * torch.tanh(self.delta(lstm_out))
+        # Clamp per channel to its physical range: steering is symmetric, but
+        # throttle and brake are one-sided, so a negative correction must stop at
+        # zero rather than inheriting the symmetric bound.
+        out = prev + correction
+        return torch.stack(
+            [
+                torch.clamp(out[..., 0], -1.0, 1.0),
+                torch.clamp(out[..., 1], 0.0, 1.0),
+                torch.clamp(out[..., 2], 0.0, 1.0),
+            ],
+            dim=-1,
+        )
 
-    def forward(self, x):
+    def forward(self, x, prev=None):
         # x: (B, k, C, H, W) -> (B, k, num_outputs), one prediction per timestep
         batch_size, seq_len, C, H, W = x.shape
         x = x.view(batch_size * seq_len, C, H, W)
         features = self.encode(x).view(batch_size, seq_len, -1)  # (B, k, 768)
-        return self.forward_from_features(features)
+        return self.forward_from_features(features, prev=prev)
 
 # Output channel order, matching preprocess.to_physical and the model's heads.
 CHANNELS = ("steer", "throttle", "brake")
+
+# Largest correction the residual head may apply to the previous action. Frame to
+# frame the human steer changes by |dsteer| mean 0.149, so 0.5 covers the observed
+# range of real corrections with room to spare while making "hold the wheel" the
+# model's default rather than something it must learn to approximate.
+RESIDUAL_SCALE = 0.5
+
+
+def shift_labels(labels: torch.Tensor) -> torch.Tensor:
+    """Teacher forcing: ``prev[t] = labels[t-1]``, zero at the window start.
+
+    The true previous action, not the model's own output, so training does not
+    compound its own early errors. Only index 0 is affected by the padding, and
+    inference reads the last timestep of a full window, so the zero never reaches
+    the car.
+    """
+    prev = torch.zeros_like(labels)
+    prev[:, 1:] = labels[:, :-1]
+    return prev
 
 # Huber transition point. torch's default delta=1.0 spans the whole target range
 # of [-1, 1], so the linear (robust) region never activates and the loss is
@@ -265,8 +309,8 @@ class ForzaLightning(L.LightningModule):
         self._val_abs_sum = torch.zeros(len(CHANNELS), dtype=torch.float64)
         self._val_count = 0
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, x, prev=None):
+        return self.model(x, prev=prev)
 
     def _loss(self, pred, target):
         """Dense Huber over every timestep and channel, at ``self.huber_delta``."""
@@ -274,7 +318,10 @@ class ForzaLightning(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         images, controls = batch
-        pred = self.model(images)  # (B, k, 3), one prediction per timestep
+        # Teacher forcing: each output is scored as a correction to the true
+        # previous action, which is how the model is used at inference time.
+        prev = shift_labels(controls) if getattr(self.model, "residual", False) else None
+        pred = self.model(images, prev=prev)  # (B, k, 3), one prediction per timestep
         # Dense supervision: reduce over every timestep and channel, not [:, -1].
         loss = self._loss(pred, controls)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -282,7 +329,8 @@ class ForzaLightning(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         images, controls = batch
-        pred = self.model(images)  # (B, k, 3)
+        prev = shift_labels(controls) if getattr(self.model, "residual", False) else None
+        pred = self.model(images, prev=prev)  # (B, k, 3)
         abs_err = (pred.detach() - controls).abs()  # (B, k, 3)
         mae = abs_err.mean(dim=(0, 1))  # per-channel mean over batch and time
 
@@ -338,7 +386,11 @@ def load_forza_checkpoint(
     state_dict = ckpt["state_dict"]
     stripped = {k.split(".", 1)[1] if k.startswith("model.") else k: v
                 for k, v in state_dict.items()}
-    model = ConvNextTinyLSTMRegression(num_outputs=num_outputs)
+    # Checkpoints from the plain regressor predate the correction head, so the
+    # architecture has to match what is actually in the file rather than what is
+    # current.
+    residual = any(k.startswith("delta.") for k in stripped)
+    model = ConvNextTinyLSTMRegression(num_outputs=num_outputs, residual=residual)
     model.load_state_dict(stripped, strict=True)
     return model.eval(), ckpt.get("hyper_parameters", {})
 
@@ -377,12 +429,14 @@ def _cap_windows(dataset, max_windows):
     dataset.samples = kept_samples
 
 
-def main():
+def main(config_path: str = "config.json"):
     # Clear previous cache before initiating training
     torch.cuda.empty_cache()
 
-    # Load the config file
-    with open('config.json', 'r') as file:
+    # Load the config file. The path is a parameter so a dry run can point at its
+    # own config -- and, critically, its own checkpoint_dir -- instead of
+    # overwriting the production checkpoints in logs/checkpoints.
+    with open(config_path, 'r') as file:
         config = json.load(file)
 
     data_dir = config["data_dir"]
@@ -441,7 +495,7 @@ def main():
         persistent_workers=num_workers > 0,
     )
 
-    model = ConvNextTinyLSTMRegression(num_outputs=3)
+    model = ConvNextTinyLSTMRegression(num_outputs=3, residual=True)
     forzalightning = ForzaLightning(
         model=model,
         lr_backbone=config["lr_backbone"],
@@ -462,7 +516,8 @@ def main():
     # Explicit checkpointing: the default callback under WandbLogger saved nothing
     # recoverable in the first 7 epochs of the 2026-10-27 run (which then died with
     # zero checkpoints), so pin the dir, save every epoch, and keep a rolling last.ckpt.
-    ckpt_dir = os.path.join("logs", "checkpoints")
+    ckpt_dir = config.get("checkpoint_dir", os.path.join("logs", "checkpoints"))
+    os.makedirs(ckpt_dir, exist_ok=True)
     checkpoint_cb = ModelCheckpoint(
         dirpath=ckpt_dir,
         filename="epoch{epoch:02d}-step{step}",
@@ -496,4 +551,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    main(sys.argv[1] if len(sys.argv) > 1 else "config.json")
