@@ -186,7 +186,7 @@ class ForzaLSTMDataset(Dataset):
         return images, labels
 
 class ConvNextTinyLSTMRegression(nn.Module):
-    def __init__(self, num_outputs=3, hidden_size=512, residual=True):
+    def __init__(self, num_outputs=3, hidden_size=512, residual=False):
         super(ConvNextTinyLSTMRegression, self).__init__()
         # Load the ConvNeXt model
         self.convnext = models.convnext_tiny(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
@@ -235,6 +235,43 @@ class ConvNextTinyLSTMRegression(nn.Module):
             ],
             dim=-1,
         )
+
+    def forward_closed_loop(self, feat, init_prev=None):
+        """Roll the policy out feeding its own outputs, as the driver does.
+
+        Teacher forcing scores each step against the human's true previous action,
+        which the car never has. Here ``out[t] = clip(out[t-1] + delta[t])``, so
+        any error the head makes is carried forward and can compound.
+
+        This is exact rather than an approximation of ``drive.py``: the correction
+        depends only on the causal LSTM output, never on ``prev``, so one LSTM
+        pass yields every delta and the recurrence is a cheap scan.
+
+        ``feat``: (B, k, 768). ``init_prev``: (B, 1, 3), the command issued before
+        the window (zeros for a stationary, centred car).
+        """
+        if not self.residual:
+            return self.forward_from_features(feat)
+        lstm_out, _ = self.lstm(feat)
+        deltas = RESIDUAL_SCALE * torch.tanh(self.delta(lstm_out))   # (B, k, 3)
+        if init_prev is None:
+            current = torch.zeros(feat.shape[0], 1, 3,
+                                  dtype=deltas.dtype, device=deltas.device)
+        else:
+            current = init_prev.to(deltas.dtype)
+        outs = []
+        for t in range(deltas.shape[1]):
+            current = current + deltas[:, t:t + 1]
+            current = torch.stack(
+                [
+                    torch.clamp(current[..., 0], -1.0, 1.0),
+                    torch.clamp(current[..., 1], 0.0, 1.0),
+                    torch.clamp(current[..., 2], 0.0, 1.0),
+                ],
+                dim=-1,
+            )
+            outs.append(current)
+        return torch.cat(outs, dim=1)
 
     def forward(self, x, prev=None):
         # x: (B, k, C, H, W) -> (B, k, num_outputs), one prediction per timestep
@@ -495,7 +532,14 @@ def main(config_path: str = "config.json"):
         persistent_workers=num_workers > 0,
     )
 
-    model = ConvNextTinyLSTMRegression(num_outputs=3, residual=True)
+    # Prediction mode: the plain regressor. Residual mode exists and is tested,
+    # but measured drive-accurate (closed-loop, own output fed back) it scored
+    # 0.481 steer MAE against 0.454 for this regressor and 0.480 for holding the
+    # wheel still -- i.e. no better than doing nothing. Under teacher forcing the
+    # anchor is the human's true action, so learning a small correction flatters
+    # the metric while throwing away the steering LEVEL that vision can predict.
+    # Do not switch this to True without re-running the closed-loop comparison.
+    model = ConvNextTinyLSTMRegression(num_outputs=3, residual=False)
     forzalightning = ForzaLightning(
         model=model,
         lr_backbone=config["lr_backbone"],

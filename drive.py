@@ -83,15 +83,17 @@ if __name__ == "__main__":
                 # Encode only the newest frame, then run the LSTM over the window.
                 feature = model.encode(x).squeeze(0)
                 window = frame_window.push(feature)
-                # Predict from the command issued last tick, so the head only has
-                # to learn the correction. Reading the last output keeps the
-                # zero-padding for t<k out of the car's controls.
-                outputs = model.forward_from_features(window, prev=prev_action)
+                # Residual checkpoints take the previous command; the regressor
+                # predicts the action directly and takes nothing.
+                if getattr(model, "residual", False):
+                    outputs = model.forward_from_features(window, prev=prev_action)
+                    prev_action = outputs[:, -1:].detach()
+                else:
+                    outputs = model.forward_from_features(window)
 
                 # Physical outputs already: steer in [-1,1], throttle/brake in [0,1].
                 steer, throttle, brake = outputs[0, -1]
                 gamepad_writer.update(float(steer), float(throttle), float(brake))
-                prev_action = outputs[:, -1:].detach()
 
                 # Recorded frames were captured at 15 FPS, so drive at 15 FPS too.
                 clock.tick(FPS_CAP)
